@@ -101,6 +101,19 @@ uv run pytest -v                                           # any pytest flags
 KUBE_CONTEXT=my-cluster NAMESPACE=opendatahub make test     # another cluster
 ```
 
+Runs are verbose by design: at INFO level the suite logs the target context and
+server version, the image each operator runs, replica and condition details, and
+the readiness of every pod, so a passing run shows what was checked and a
+failing one says what was not.
+
+Every run also writes a self-contained HTML report to `reports/report.html`
+(git-ignored) that keeps the captured log and failure detail per test:
+
+```sh
+make test REPORT_FILE=/tmp/trustyai.html       # choose the report path
+uv run pytest --html=/tmp/trustyai.html        # same, without make
+```
+
 Checks run against `KUBE_CONTEXT` (default `kind-trustyai`) and `NAMESPACE`
 (default `system`), the values the harness uses by default. A missing kubeconfig
 or context skips the suite; a missing Deployment fails with a pointer to

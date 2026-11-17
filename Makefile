@@ -37,6 +37,7 @@ ENGINE ?=
 TRUSTYAI_CR_FILE ?= hack/manifests/trustyai-cr.yaml
 TIMEOUT ?= 300s
 PYTEST_ARGS ?=
+REPORT_FILE ?= reports/report.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
 	WORKLOAD_IMG MODULE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT
@@ -75,8 +76,10 @@ up: cluster images load deploy ## Create the cluster, build, load and deploy.
 down: cluster-delete ## Tear everything down.
 
 .PHONY: test
-test: ## Run the pytest suite against the deployed operators.
-	uv run pytest $(PYTEST_ARGS)
+test: ## Run the pytest suite and write an HTML report.
+	@uv run pytest $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(REPORT_FILE))"; \
+		exit $${status:-0}
 
 .PHONY: lint
 lint: ## Lint and format-check the Python sources.
