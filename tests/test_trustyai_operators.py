@@ -17,8 +17,16 @@ from utilities.kube import assert_deployment_healthy, container_images, read_dep
 LOGGER = logging.getLogger(__name__)
 
 OPERATOR_DEPLOYMENTS = [
-    pytest.param("trustyai-operator-module-controller-manager", id="module-operator"),
-    pytest.param("trustyai-service-operator-controller-manager", id="workload-operator"),
+    pytest.param(
+        "trustyai-operator-module-controller-manager",
+        id="module-operator",
+        marks=pytest.mark.module,
+    ),
+    pytest.param(
+        "trustyai-service-operator-controller-manager",
+        id="workload-operator",
+        marks=pytest.mark.workload,
+    ),
 ]
 
 EXPECTED_REPLICAS = 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import pytest
 from kubernetes import client, config
@@ -161,3 +162,44 @@ def assert_deployment_healthy(
         details = "\n  - ".join(problems)
         pytest.fail(f"deployment {namespace}/{name} is not healthy:\n  - {details}", pytrace=False)
     LOGGER.info("%s/%s is healthy", namespace, name)
+
+
+def wait_for_deployment_available(
+    apps_client: client.AppsV1Api,
+    name: str,
+    namespace: str,
+    timeout: int = 300,
+    interval: int = 5,
+) -> client.V1Deployment:
+    """Poll until the Deployment has finished rolling out."""
+    deadline = time.monotonic() + timeout
+    deployment = read_deployment(apps_client, name=name, namespace=namespace)
+    while True:
+        desired = deployment.spec.replicas if deployment.spec.replicas is not None else 1
+        status = deployment.status
+        ready = status.ready_replicas or 0
+        updated = status.updated_replicas or 0
+        # A complete rollout, not just one available replica: while an old
+        # ReplicaSet is still draining, two pods exist and a test that looks at
+        # this Deployment's pods sees a moving target.
+        if ready == desired and updated == desired and not status.unavailable_replicas:
+            LOGGER.info("%s/%s is rolled out: %d/%d ready", namespace, name, ready, desired)
+            return deployment
+        if time.monotonic() >= deadline:
+            break
+        LOGGER.info(
+            "%s/%s rolling out: %d/%d ready, %d/%d updated: %s",
+            namespace,
+            name,
+            ready,
+            desired,
+            updated,
+            desired,
+            _describe_conditions(deployment),
+        )
+        time.sleep(interval)
+        deployment = read_deployment(apps_client, name=name, namespace=namespace)
+    pytest.fail(
+        f"deployment {namespace}/{name} did not become available within {timeout}s: {_describe_conditions(deployment)}",
+        pytrace=False,
+    )

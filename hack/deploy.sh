@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Deploy the TrustyAI module operator on Kind, overriding the module operator
-# image, the workload operator image it renders, and the target namespace.
+# image, the workload operator image it renders, the EvalHub image the workload
+# operator resolves, and the target namespace.
+#
+# The operators only: EvalHub instances, their namespaces and their TLS material
+# are created by the tests, the way a user or the platform operator would.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -43,6 +47,28 @@ module_name=$IMG_NAME module_tag=$IMG_TAG
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
 cp -a "$module_config" "$workdir/config"
+# EVALHUB_IMG overrides the operand image the module operator passes to the
+# workload operator through params.env.
+module_env_patch=$(cat <<EOF
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_OPERATOR_IMAGE
+          value: $WORKLOAD_IMG
+EOF
+)
+if [[ -n "${EVALHUB_IMG:-}" ]]; then
+	module_env_patch+=$(cat <<EOF
+
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_EVAL_HUB_IMAGE
+          value: $EVALHUB_IMG
+EOF
+)
+fi
+
 cat >"$workdir/kustomization.yaml" <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -60,19 +86,21 @@ patches:
       kind: Deployment
       name: trustyai-operator-module-controller-manager
     patch: |-
-      - op: add
-        path: /spec/template/spec/containers/0/env/-
-        value:
-          name: RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_OPERATOR_IMAGE
-          value: $WORKLOAD_IMG
+$module_env_patch
 EOF
 
 info "deploying the module operator ($MODULE_IMG) with workload image $WORKLOAD_IMG"
+if [[ -n "${EVALHUB_IMG:-}" ]]; then
+	info "passing EvalHub image $EVALHUB_IMG to the workload operator"
+fi
 kube apply -k "$workdir" --server-side=true
 
+# rollout status, not just Available: an existing pod set satisfies Available
+# while a new image is still rolling out, and the next step reads what the new
+# module operator renders.
 info "waiting for the module operator deployment"
-kube -n "$NAMESPACE" wait --for=condition=Available \
-	deployment/trustyai-operator-module-controller-manager --timeout "$TIMEOUT"
+kube -n "$NAMESPACE" rollout status deployment/trustyai-operator-module-controller-manager \
+	--timeout "$TIMEOUT"
 
 info "seeding the Prometheus instance the module operator expects"
 cat <<EOF | kube apply -f -
@@ -84,8 +112,8 @@ metadata:
 EOF
 
 # On OpenShift the service CA creates these from the serving-cert annotations;
-# on Kind they have to exist before the workload operator pods can start. They are
-# only created once so repeat deploys keep the same certificate.
+# on Kind they have to exist before the operator pods can start. They are only
+# created once so repeat deploys keep the same certificate.
 create_tls_secrets() {
 	local dir="$workdir/certs"
 	python3 "$here/gen-certs.py" --namespace "$NAMESPACE" --out-dir "$dir"
@@ -113,8 +141,67 @@ for _ in $(seq 1 90); do
 done
 kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager >/dev/null ||
 	die "the module operator did not create the workload operator deployment"
-kube -n "$NAMESPACE" wait --for=condition=Available \
-	deployment/trustyai-service-operator-controller-manager --timeout "$TIMEOUT"
+
+# The module operator renders the workload operator's pod spec (its image and
+# the RELATED_IMAGE_* values it resolves operands from) from params.env, and it
+# rewrites params.env from its own env only on its next reconcile. Wait for the
+# rendered values here: creating an operand before they land would pin the old
+# image, which is exactly what a re-deploy with a new image would otherwise do.
+wait_for_workload_image() {
+	local want=$1 image=""
+	for _ in $(seq 1 90); do
+		image=$(kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager \
+			-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+		if [[ "$image" == "$want" ]]; then
+			info "workload operator image is $want"
+			return 0
+		fi
+		sleep 2
+	done
+	die "the module operator never rendered the workload operator image $want (last: ${image:-unset})"
+}
+
+wait_for_operand_image_env() {
+	local env_name=$1 want=$2 envs key value got=""
+	for _ in $(seq 1 90); do
+		envs=$(kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager \
+			-o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null || true)
+		got=""
+		while IFS='=' read -r key value; do
+			if [[ "$key" == "$env_name" ]]; then
+				got=$value
+				break
+			fi
+		done <<<"$envs"
+		if [[ "$got" == "$want" ]]; then
+			info "workload operator resolves $env_name=$want"
+			return 0
+		fi
+		sleep 2
+	done
+	die "the workload operator never rendered $env_name=$want (last: ${got:-unset})"
+}
+
+wait_for_workload_image "$WORKLOAD_IMG"
+
+# The EvalHub image the workload operator should resolve: the requested one, or
+# the default the module image bakes into params.env. Gating on both directions
+# keeps a re-deploy without EVALHUB_IMG from leaving an operand pinned to the
+# previously requested image.
+evalhub_want=$EVALHUB_IMG
+if [[ -z "$evalhub_want" ]]; then
+	params_env="$OPERATOR_REPO/trustyai-operator-module/config/manifests-template/base/params.env"
+	if [[ -f "$params_env" ]]; then
+		evalhub_want=$(grep -m1 '^evalHubImage=' "$params_env" | cut -d= -f2- || true)
+	fi
+fi
+if [[ -n "$evalhub_want" ]]; then
+	wait_for_operand_image_env RELATED_IMAGE_ODH_EVAL_HUB_IMAGE "$evalhub_want"
+else
+	warn "could not read the default evalHubImage from params.env; not waiting for the operand image"
+fi
+kube -n "$NAMESPACE" rollout status deployment/trustyai-service-operator-controller-manager \
+	--timeout "$TIMEOUT"
 
 for crd in trustyaiservices.trustyai.opendatahub.io evalhubs.trustyai.opendatahub.io; do
 	if [[ $(kube get crd "$crd" -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null) == Webhook ]]; then
