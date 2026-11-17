@@ -38,7 +38,8 @@ make load       # load both images into the cluster
 make deploy     # deploy the module operator, pointing it at the built images
 ```
 
-Tear everything down with `make down`.
+Tear the cluster down with `make down`; `make clean` also deletes the images
+the harness built and the HTML report, without touching the cluster.
 
 ### What `make deploy` does
 
@@ -97,7 +98,7 @@ every container ready.
 
 ```sh
 make test                                                  # default target
-uv run pytest -v                                           # any pytest flags
+make test PYTEST_ARGS="-v"                                 # extra pytest flags
 KUBE_CONTEXT=my-cluster NAMESPACE=opendatahub make test     # another cluster
 ```
 
@@ -111,7 +112,6 @@ Every run also writes a self-contained HTML report to `reports/report.html`
 
 ```sh
 make test REPORT_FILE=/tmp/trustyai.html       # choose the report path
-uv run pytest --html=/tmp/trustyai.html        # same, without make
 ```
 
 Checks run against `KUBE_CONTEXT` (default `kind-trustyai`) and `NAMESPACE`
@@ -126,6 +126,6 @@ Layout:
   clients and turns Deployment and pod status into readable failures
 - `conftest.py` — session fixtures for the context, namespace and API clients
 - `pyproject.toml` — `kubernetes` and `pytest` dependencies plus the `ruff`
-  configuration; everything runs through `uv run`
+  configuration; the make targets prepare the environment and run them
 
 `make lint` runs `ruff check` and `ruff format --check`; `make fmt` fixes both.

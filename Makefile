@@ -40,7 +40,7 @@ PYTEST_ARGS ?=
 REPORT_FILE ?= reports/report.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
-	WORKLOAD_IMG MODULE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT
+	WORKLOAD_IMG MODULE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT REPORT_FILE
 
 .PHONY: help
 help: ## Display this help.
@@ -73,7 +73,11 @@ deploy: ## Deploy the module operator, overriding the image values with the buil
 up: cluster images load deploy ## Create the cluster, build, load and deploy.
 
 .PHONY: down
-down: cluster-delete ## Tear everything down.
+down: cluster-delete ## Delete the Kind cluster.
+
+.PHONY: clean
+clean: ## Delete the built operator images and the HTML report (leaves the cluster).
+	hack/clean.sh
 
 .PHONY: test
 test: ## Run the pytest suite and write an HTML report.
