@@ -131,3 +131,5 @@ Layout:
   configuration; the make targets prepare the environment and run them
 
 `make lint` runs `ruff check` and `ruff format --check`; `make fmt` fixes both.
+`.github/workflows/python-lint.yaml` runs `make lint` in CI on pushes to
+`main` and on pull requests.
