@@ -4,7 +4,8 @@
 #
 # creates a Kind cluster, builds the workload and module operator images from
 # that checkout, loads them into the cluster, and deploys the module operator
-# pointed at the freshly built workload operator image.
+# pointed at the freshly built workload operator image. The module operator then
+# deploys the workload operator, which deploys EvalHub.
 
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -o pipefail -ec
@@ -36,12 +37,16 @@ MODULE_IMG ?= $(IMAGE_PREFIX)/trustyai-operator-module:$(TAG)
 ENGINE ?=
 
 TRUSTYAI_CR_FILE ?= hack/manifests/trustyai-cr.yaml
+# EvalHub operand image passed to the workload operator through the module
+# operator's RELATED_IMAGE_ODH_EVAL_HUB_IMAGE. Empty keeps the operator's own
+# pin (quay.io/evalhub/evalhub:latest in its params.env).
+EVALHUB_IMG ?=
 TIMEOUT ?= 300s
 PYTEST_ARGS ?=
 REPORT_FILE ?= reports/report.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
-	WORKLOAD_IMG MODULE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT REPORT_FILE
+	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT REPORT_FILE
 
 .PHONY: help
 help: ## Display this help.
@@ -109,12 +114,15 @@ fmt: ## Format and autofix the Python sources.
 	uv run ruff check --fix .
 
 .PHONY: status
-status: ## Show the module CR, the two operators and their pods.
+status: ## Show the module CR, the operators, EvalHub, and their pods.
 	$(KUBECTL) --context $(KUBE_CONTEXT) get trustyais.components.platform.opendatahub.io --ignore-not-found
 	$(KUBECTL) --context $(KUBE_CONTEXT) -n $(NAMESPACE) get deployment,pods \
 		-l app.kubernetes.io/name=trustyai-operator-module --ignore-not-found
 	$(KUBECTL) --context $(KUBE_CONTEXT) -n $(NAMESPACE) get deployment,pods \
 		-l control-plane=trustyai-service-operator --ignore-not-found
+	$(KUBECTL) --context $(KUBE_CONTEXT) get evalhubs.trustyai.opendatahub.io -A --ignore-not-found
+	$(KUBECTL) --context $(KUBE_CONTEXT) get deploy,pods -A \
+		-l app=eval-hub --ignore-not-found
 
 .PHONY: logs
 logs: ## Tail the module and workload operator logs.
