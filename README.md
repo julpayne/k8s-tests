@@ -94,9 +94,9 @@ the harness built and the HTML report, without touching the cluster.
 
 `tests/` holds the pytest checks that run against a live cluster; they are kept
 separate from the harness so they can point at any cluster that runs the same
-operators. The first suite asserts that both operator Deployments exist and are
-healthy: `Available`, the desired replicas ready, and their pods `Running` with
-every container ready.
+operators. The first suite asserts that both operator Deployments exist, ask
+for a single replica, and are healthy: `Available`, the desired replicas ready,
+and their pods `Running` with every container ready.
 
 ```sh
 make test                                                  # default target

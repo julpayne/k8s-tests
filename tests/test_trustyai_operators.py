@@ -21,6 +21,8 @@ OPERATOR_DEPLOYMENTS = [
     pytest.param("trustyai-service-operator-controller-manager", id="workload-operator"),
 ]
 
+EXPECTED_REPLICAS = 1
+
 
 @pytest.mark.parametrize("name", OPERATOR_DEPLOYMENTS)
 def test_deployment_exists(apps_client: client.AppsV1Api, namespace: str, name: str) -> None:
@@ -36,6 +38,23 @@ def test_deployment_exists(apps_client: client.AppsV1Api, namespace: str, name: 
 
     assert deployment.metadata.name == name
     assert deployment.spec.replicas, f"deployment {namespace}/{name} asks for no replicas"
+
+
+@pytest.mark.parametrize("name", OPERATOR_DEPLOYMENTS)
+def test_deployment_has_single_replica(apps_client: client.AppsV1Api, namespace: str, name: str) -> None:
+    LOGGER.info("checking that deployment %s/%s asks for %d replica", namespace, name, EXPECTED_REPLICAS)
+    deployment = read_deployment(apps_client, name=name, namespace=namespace)
+    LOGGER.info(
+        "deployment %s/%s wants %s replica(s), %s ready",
+        namespace,
+        name,
+        deployment.spec.replicas,
+        deployment.status.ready_replicas or 0,
+    )
+
+    assert deployment.spec.replicas == EXPECTED_REPLICAS, (
+        f"deployment {namespace}/{name} asks for {deployment.spec.replicas} replica(s), expected {EXPECTED_REPLICAS}"
+    )
 
 
 @pytest.mark.parametrize("name", OPERATOR_DEPLOYMENTS)
