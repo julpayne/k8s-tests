@@ -26,7 +26,8 @@ KIND_ENV := $(if $(KIND_PROVIDER),KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER))
 NAMESPACE ?= system
 
 # Checkout of trustyai-service-operator used for the images and the manifests.
-OPERATOR_REPO ?= $(HOME)/Sync/code/reference/trustyai-service-operator
+# Required by `up`, `images` and `deploy`; there is no default.
+OPERATOR_REPO ?=
 TAG ?= dev
 IMAGE_PREFIX ?= localhost
 WORKLOAD_IMG ?= $(IMAGE_PREFIX)/trustyai-service-operator:$(TAG)
@@ -57,8 +58,20 @@ cluster: ## Create the Kind cluster (idempotent).
 cluster-delete: ## Delete the Kind cluster.
 	$(KIND_ENV) $(KIND) delete cluster --name $(KIND_CLUSTER)
 
+.PHONY: check-operator-repo
+check-operator-repo:
+	@test -n "$(OPERATOR_REPO)" || { \
+		echo "error: OPERATOR_REPO is required, e.g. make $(MAKECMDGOALS) OPERATOR_REPO=/path/to/trustyai-service-operator" >&2; \
+		exit 2; \
+	}
+	@test -d "$(OPERATOR_REPO)" || { echo "error: OPERATOR_REPO=$(OPERATOR_REPO) does not exist" >&2; exit 2; }
+	@test -f "$(OPERATOR_REPO)/Dockerfile" -a -f "$(OPERATOR_REPO)/trustyai-operator-module/Dockerfile" || { \
+		echo "error: $(OPERATOR_REPO) does not look like a trustyai-service-operator checkout" >&2; \
+		exit 2; \
+	}
+
 .PHONY: images
-images: ## Build the workload and module operator images from OPERATOR_REPO.
+images: check-operator-repo ## Build the workload and module operator images from OPERATOR_REPO.
 	hack/build-images.sh
 
 .PHONY: load
@@ -66,11 +79,11 @@ load: ## Load the built images into the Kind cluster.
 	hack/load-images.sh
 
 .PHONY: deploy
-deploy: ## Deploy the module operator, overriding the image values with the built ones.
+deploy: check-operator-repo ## Deploy the module operator, overriding the image values with the built ones.
 	hack/deploy.sh
 
 .PHONY: up
-up: cluster images load deploy ## Create the cluster, build, load and deploy.
+up: check-operator-repo cluster images load deploy ## Create the cluster, build, load and deploy.
 
 .PHONY: down
 down: cluster-delete ## Delete the Kind cluster.

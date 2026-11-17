@@ -16,8 +16,7 @@ from the manifests baked into its image.
 - `kind`, `kubectl`, and `python3` with the [`cryptography`][cryptography]
   package
 - `podman` or `docker` to build the images
-- a `trustyai-service-operator` checkout (defaults to
-  `~/Sync/code/reference/trustyai-service-operator`)
+- a `trustyai-service-operator` checkout, passed as `OPERATOR_REPO`
 
 [cryptography]: https://cryptography.io/
 
@@ -37,6 +36,9 @@ make images     # build the workload and module operator images from OPERATOR_RE
 make load       # load both images into the cluster
 make deploy     # deploy the module operator, pointing it at the built images
 ```
+
+`up`, `images` and `deploy` require `OPERATOR_REPO` and stop with a pointer to
+the flag when it is missing or does not look like an operator checkout.
 
 Tear the cluster down with `make down`; `make clean` also deletes the images
 the harness built and the HTML report, without touching the cluster.
@@ -62,7 +64,7 @@ the harness built and the HTML report, without touching the cluster.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OPERATOR_REPO` | `~/Sync/code/reference/trustyai-service-operator` | Checkout the images and manifests come from |
+| `OPERATOR_REPO` | *(required)* | Checkout the images and manifests come from |
 | `KIND_CLUSTER` | `trustyai` | Kind cluster name (context `kind-<name>`) |
 | `KIND_NODE_IMAGE` | Kind's default | Pin a node image, e.g. `kindest/node:v1.29.0` |
 | `KIND_PROVIDER` | auto | Force `podman` or `docker` on hosts that have both |
