@@ -26,6 +26,7 @@ from the manifests baked into its image.
 ```sh
 make up OPERATOR_REPO=/path/to/trustyai-service-operator
 make status
+make test       # pytest checks against what was just deployed
 ```
 
 `make up` is the four steps below, run in order; each is also usable on its own:
@@ -85,3 +86,33 @@ Tear everything down with `make down`.
   `make -C $OPERATOR_REPO sync-trustyai-module-manifests`.
 - `make logs` tails the module operator; the workload operator has its own
   pods in the same namespace (`-l control-plane=trustyai-service-operator`).
+
+## Pytest suite
+
+`tests/` holds the pytest checks that run against a live cluster; they are kept
+separate from the harness so they can point at any cluster that runs the same
+operators. The first suite asserts that both operator Deployments exist and are
+healthy: `Available`, the desired replicas ready, and their pods `Running` with
+every container ready.
+
+```sh
+make test                                                  # default target
+uv run pytest -v                                           # any pytest flags
+KUBE_CONTEXT=my-cluster NAMESPACE=opendatahub make test     # another cluster
+```
+
+Checks run against `KUBE_CONTEXT` (default `kind-trustyai`) and `NAMESPACE`
+(default `system`), the values the harness uses by default. A missing kubeconfig
+or context skips the suite; a missing Deployment fails with a pointer to
+`make up`.
+
+Layout:
+
+- `tests/` — test modules, one file per area
+- `utilities/` — helpers shared by the tests; `utilities/kube.py` loads the
+  clients and turns Deployment and pod status into readable failures
+- `conftest.py` — session fixtures for the context, namespace and API clients
+- `pyproject.toml` — `kubernetes` and `pytest` dependencies plus the `ruff`
+  configuration; everything runs through `uv run`
+
+`make lint` runs `ruff check` and `ruff format --check`; `make fmt` fixes both.

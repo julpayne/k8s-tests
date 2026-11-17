@@ -36,6 +36,7 @@ ENGINE ?=
 
 TRUSTYAI_CR_FILE ?= hack/manifests/trustyai-cr.yaml
 TIMEOUT ?= 300s
+PYTEST_ARGS ?=
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
 	WORKLOAD_IMG MODULE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT
@@ -72,6 +73,20 @@ up: cluster images load deploy ## Create the cluster, build, load and deploy.
 
 .PHONY: down
 down: cluster-delete ## Tear everything down.
+
+.PHONY: test
+test: ## Run the pytest suite against the deployed operators.
+	uv run pytest $(PYTEST_ARGS)
+
+.PHONY: lint
+lint: ## Lint and format-check the Python sources.
+	uv run ruff check .
+	uv run ruff format --check .
+
+.PHONY: fmt
+fmt: ## Format and autofix the Python sources.
+	uv run ruff format .
+	uv run ruff check --fix .
 
 .PHONY: status
 status: ## Show the module CR, the two operators and their pods.
