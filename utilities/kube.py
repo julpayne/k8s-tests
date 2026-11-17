@@ -14,6 +14,11 @@ from kubernetes.config.config_exception import ConfigException
 DEFAULT_CONTEXT = "kind-trustyai"
 DEFAULT_NAMESPACE = "system"
 
+# Set by `make test KEEP_RESOURCES=1` (or pytest's --keep-resources): the fixtures
+# then leave what they created on the cluster for inspection.
+KEEP_RESOURCES_VAR = "KEEP_RESOURCES"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -25,6 +30,11 @@ def context_from_env() -> str:
 def namespace_from_env() -> str:
     """Namespace under test; the Makefile deploys into `system`."""
     return os.environ.get("NAMESPACE", DEFAULT_NAMESPACE)
+
+
+def keep_resources() -> bool:
+    """Whether the fixtures should leave their resources on the cluster."""
+    return os.environ.get(KEEP_RESOURCES_VAR, "").strip().lower() in _TRUTHY
 
 
 def load_clients(context: str) -> tuple[client.CoreV1Api, client.AppsV1Api]:
@@ -164,14 +174,29 @@ def assert_deployment_healthy(
     LOGGER.info("%s/%s is healthy", namespace, name)
 
 
+def _terminating_pods(deployment: client.V1Deployment, core_client: client.CoreV1Api, namespace: str) -> list[str]:
+    """Names of pods that still match the selector but are being deleted."""
+    return [
+        pod.metadata.name
+        for pod in _pods_for(deployment, core_client, namespace)
+        if pod.metadata.deletion_timestamp is not None
+    ]
+
+
 def wait_for_deployment_available(
     apps_client: client.AppsV1Api,
     name: str,
     namespace: str,
     timeout: int = 300,
     interval: int = 5,
+    core_client: client.CoreV1Api | None = None,
 ) -> client.V1Deployment:
-    """Poll until the Deployment has finished rolling out."""
+    """Poll until the Deployment has finished rolling out.
+
+    With `core_client`, a pod set that still holds a terminating pod does not
+    count: a Service keeps routing to it for as long as it is listed, so a check
+    that immediately calls the Service can be served by the pod being replaced.
+    """
     deadline = time.monotonic() + timeout
     deployment = read_deployment(apps_client, name=name, namespace=namespace)
     while True:
@@ -182,9 +207,12 @@ def wait_for_deployment_available(
         # A complete rollout, not just one available replica: while an old
         # ReplicaSet is still draining, two pods exist and a test that looks at
         # this Deployment's pods sees a moving target.
-        if ready == desired and updated == desired and not status.unavailable_replicas:
+        terminating = _terminating_pods(deployment, core_client, namespace) if core_client else []
+        if ready == desired and updated == desired and not status.unavailable_replicas and not terminating:
             LOGGER.info("%s/%s is rolled out: %d/%d ready", namespace, name, ready, desired)
             return deployment
+        if terminating:
+            LOGGER.info("%s/%s still terminating: %s", namespace, name, ", ".join(sorted(terminating)))
         if time.monotonic() >= deadline:
             break
         LOGGER.info(
