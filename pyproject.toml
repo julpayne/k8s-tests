@@ -1,0 +1,38 @@
+[project]
+name = "k8s-tests"
+version = "0.1.0"
+description = "Kubernetes-level tests and harnesses for the TrustyAI components"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "kubernetes>=31.0.0",
+    "pytest>=8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest-html>=4.1",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "-v",
+    "--strict-config",
+    "--strict-markers",
+    "--durations=10",
+    "--html=reports/report.html",
+    "--self-contained-html",
+]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+log_cli_date_format = "%H:%M:%S"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
