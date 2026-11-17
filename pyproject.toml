@@ -21,6 +21,8 @@ dev = [
 testpaths = ["tests"]
 markers = [
     "evalhub: checks for the EvalHub instance the workload operator deploys",
+    "emulator: checks for the LLM emulator and the token it requires",
+    "benchmark: checks that submit an evaluation job and read its results",
     "module: checks for the TrustyAI module operator and the TrustyAI resource it reconciles",
     "workload: checks for the TrustyAI workload (service) operator",
 ]

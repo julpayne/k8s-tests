@@ -16,9 +16,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import logging
-import os
-import shutil
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -32,6 +29,9 @@ from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import NotFoundError
 
 from utilities.certs import generate_serving_cert, service_dns_names
+from utilities.kube import keep_resources
+from utilities.portforward import kubectl_binary
+from utilities.portforward import port_forward as _forward_port
 
 LOGGER = logging.getLogger(__name__)
 
@@ -60,12 +60,28 @@ EVALHUB_TENANT_CONFIG_MAPS = (
     f"{EVALHUB_NAME}-mlflow-ca-bundle",
     "evalhub-discovery",
 )
+EVALHUB_JOBS_PATH = "/api/v1/evaluations/jobs"
+# Terminal job states; anything else keeps polling.
+JOB_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+# kube-rbac-proxy authorizes the API with namespace-scoped SubjectAccessReviews
+# whose namespace comes from the X-Tenant header, against these pseudo-resources.
+TENANT_API_RESOURCES = ("evaluations", "providers", "collections", "status-events")
+TENANT_API_VERBS = ["get", "list", "create", "update", "patch", "delete"]
+TENANT_IDENTITY_NAME = "evalhub-api"
+# Names the operator does not manage: see grant_tenant_job_access.
+TENANT_JOB_ACCESS_BINDING = "k8s-tests-instance-api-job-access"
+TENANT_JOB_ACCESS_ROLES = (
+    "trustyai-service-operator-evalhub-job-config",
+    "trustyai-service-operator-evalhub-jobs-writer",
+)
+TENANT_TOKEN_DURATION = "1h"
+TENANT_RBAC_TIMEOUT = 120
+
 CONDITION_READY = "Ready"
 CONDITION_MONITORING_DEGRADED = "MonitoringDegraded"
 
 DEFAULT_WAIT_TIMEOUT = 300
 WAIT_INTERVAL = 5
-PORT_FORWARD_TIMEOUT = 30.0
 
 
 def evalhub_api_version(api_client: client.ApiClient) -> str:
@@ -184,6 +200,18 @@ def create_namespace(core_client: client.CoreV1Api, name: str, labels: dict[str,
     return name
 
 
+def release_namespace(core_client: client.CoreV1Api, name: str) -> None:
+    """Delete a namespace the tests created, or leave it for inspection."""
+    if keep_resources():
+        LOGGER.warning(
+            "keeping namespace %s: kubectl -n %s get all,cm,evalhubs,jobs",
+            name,
+            name,
+        )
+        return
+    delete_namespace(core_client, name)
+
+
 def delete_namespace(core_client: client.CoreV1Api, name: str) -> None:
     """Delete a namespace, tolerating one that is already gone."""
     try:
@@ -236,51 +264,18 @@ def container_image(deployment: client.V1Deployment, container_name: str) -> str
     return None
 
 
-def _kubectl() -> str:
-    kubectl = os.environ.get("KUBECTL") or "kubectl"
-    if shutil.which(kubectl) is None:
-        pytest.skip(f"{kubectl} is not installed, so the EvalHub API cannot be reached")
-    return kubectl
-
-
-def _wait_for_local_port(port: int, process: subprocess.Popen[str], timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            output = process.stdout.read() if process.stdout else ""
-            pytest.fail(f"port-forward exited before serving port {port}:\n{output}", pytrace=False)
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return
-        except OSError:
-            time.sleep(0.2)
-    pytest.fail(f"port-forward did not serve port {port} within {timeout}s", pytrace=False)
-
-
 @contextlib.contextmanager
 def port_forward(context: str, namespace: str, target: str, local_port: int, remote_port: int) -> Iterator[str]:
-    """Forward `local_port` to `target` and yield the local base URL."""
-    command = [
-        _kubectl(),
-        "--context",
-        context,
-        "--namespace",
-        namespace,
-        "port-forward",
-        target,
-        f"{local_port}:{remote_port}",
-    ]
-    LOGGER.info("forwarding 127.0.0.1:%d to %s/%s:%d", local_port, namespace, target, remote_port)
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    try:
-        _wait_for_local_port(local_port, process, PORT_FORWARD_TIMEOUT)
-        yield f"https://127.0.0.1:{local_port}"
-    finally:
-        process.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=10)
-        if process.poll() is None:
-            process.kill()
+    """Forward `local_port` to EvalHub's TLS port and yield the local HTTPS base URL."""
+    with _forward_port(
+        context=context,
+        namespace=namespace,
+        target=target,
+        local_port=local_port,
+        remote_port=remote_port,
+        scheme="https",
+    ) as url:
+        yield url
 
 
 def request(
@@ -292,3 +287,279 @@ def request(
     """Send a request to EvalHub without verifying the certificate the tests minted."""
     LOGGER.info("%s %s", method.upper(), url)
     return requests.request(method, url, headers=headers, verify=False, timeout=timeout)
+
+
+def instance_tls_cert(core_client: client.CoreV1Api, namespace: str, name: str = EVALHUB_NAME) -> bytes:
+    """The certificate the instance's kube-rbac-proxy serves, from its `<name>-tls` Secret."""
+    secret = core_client.read_namespaced_secret(name=f"{name}-tls", namespace=namespace)
+    return base64.b64decode((secret.data or {})["tls.crt"])
+
+
+def seed_tenant_ca(core_client: client.CoreV1Api, tenant_namespace: str, cert_pem: bytes, timeout: int = 300) -> None:
+    """Fill the tenant's `<name>-service-ca` ConfigMap with the instance certificate.
+
+    The operator creates that ConfigMap with no data, expecting the OpenShift
+    service CA to fill it in; the evaluation sidecar reads `service-ca.crt` from it
+    to verify the instance it reports to. Kind has no service CA, so the tests put
+    the certificate the instance actually serves there.
+    """
+    config_map_name = f"{EVALHUB_NAME}-service-ca"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            core_client.read_namespaced_config_map(name=config_map_name, namespace=tenant_namespace)
+            break
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"the operator never created {tenant_namespace}/{config_map_name}, "
+                "so the evaluation sidecar has no CA to verify the instance with",
+                pytrace=False,
+            )
+        time.sleep(WAIT_INTERVAL)
+    core_client.patch_namespaced_config_map(
+        name=config_map_name,
+        namespace=tenant_namespace,
+        body={"data": {"service-ca.crt": cert_pem.decode()}},
+    )
+    LOGGER.info("seeded %s/%s with the instance certificate", tenant_namespace, config_map_name)
+
+
+def wait_for_tenant_rbac(
+    rbac_client: client.RbacAuthorizationV1Api,
+    tenant_namespace: str,
+    instance_namespace: str,
+    timeout: int = TENANT_RBAC_TIMEOUT,
+) -> None:
+    """Wait until the operator has granted the instance's API access to the tenant.
+
+    A tenant namespace created after the instance is ready is provisioned by the
+    operator's namespace watch, which also binds the roles the API needs to write
+    the job's spec ConfigMap and Job into the tenant. Submitting before that lands
+    makes the run fail with a permission error that says nothing about the code
+    under test.
+
+    The binding is checked by subject, not only by name: every instance is called
+    `evalhub`, so a second instance pointed at the same tenant would otherwise
+    satisfy a name check while binding its own ServiceAccount instead of this one.
+    """
+    api_service_account = f"{EVALHUB_NAME}-service"
+    deadline = time.monotonic() + timeout
+    names: list[str] = []
+    while True:
+        bindings = rbac_client.list_namespaced_role_binding(namespace=tenant_namespace).items
+        names = [binding.metadata.name for binding in bindings]
+        for binding in bindings:
+            if not binding.metadata.name.endswith("-job-config-rb"):
+                continue
+            subjects = {(s.namespace, s.name) for s in binding.subjects or []}
+            if (instance_namespace, api_service_account) in subjects:
+                # Read it again after a pause: another EvalHub instance in the
+                # cluster rewrites these subjects on its own reconcile, so a
+                # single observation can be a binding that is about to flip back.
+                time.sleep(WAIT_INTERVAL)
+                bindings = rbac_client.list_namespaced_role_binding(namespace=tenant_namespace).items
+                current = {
+                    (s.namespace, s.name)
+                    for item in bindings
+                    if item.metadata.name == binding.metadata.name
+                    for s in item.subjects or []
+                }
+                if (instance_namespace, api_service_account) in current:
+                    LOGGER.info("%s/%s may write job configmaps", tenant_namespace, api_service_account)
+                    return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(WAIT_INTERVAL)
+    pytest.fail(
+        f"the operator did not grant {instance_namespace}/{api_service_account} access to tenant namespace "
+        f"{tenant_namespace} within {timeout}s; role bindings present: {sorted(names) or 'none'}",
+        pytrace=False,
+    )
+
+
+def grant_tenant_job_access(
+    rbac_client: client.RbacAuthorizationV1Api,
+    tenant_namespace: str,
+    instance_namespace: str,
+    instance_name: str = EVALHUB_NAME,
+) -> None:
+    """Bind the instance's API ServiceAccount to the roles a job needs in the tenant.
+
+    The operator creates those bindings too, but every instance is called `evalhub`
+    and each one rewrites the subjects of the same binding on its own reconcile, so
+    an instance left behind by an earlier run - exactly what `KEEP_RESOURCES`
+    leaves - can take the grant away between the check that saw it and the job that
+    needs it. These bindings carry a name the operator does not manage, so they
+    stay put and keep the run independent of who reconciled last.
+    """
+    subjects = [
+        client.RbacV1Subject(
+            kind="ServiceAccount",
+            name=f"{instance_name}-service",
+            namespace=instance_namespace,
+        )
+    ]
+    for role in TENANT_JOB_ACCESS_ROLES:
+        name = f"{TENANT_JOB_ACCESS_BINDING}-{role.rsplit('-', 1)[-1]}"
+        body = client.V1RoleBinding(
+            metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace),
+            role_ref=client.V1RoleRef(api_group="rbac.authorization.k8s.io", kind="ClusterRole", name=role),
+            subjects=subjects,
+        )
+        try:
+            rbac_client.create_namespaced_role_binding(namespace=tenant_namespace, body=body)
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            rbac_client.replace_namespaced_role_binding(name=name, namespace=tenant_namespace, body=body)
+        LOGGER.info(
+            "granted %s/%s-service the %s role in %s",
+            instance_namespace,
+            instance_name,
+            role,
+            tenant_namespace,
+        )
+
+
+def create_tenant_identity(
+    core_client: client.CoreV1Api,
+    rbac_client: client.RbacAuthorizationV1Api,
+    tenant_namespace: str,
+    name: str = TENANT_IDENTITY_NAME,
+) -> str:
+    """Create the ServiceAccount a tenant's user acts as, and grant it the API.
+
+    The API checks call EvalHub as this identity: the proxy's SubjectAccessReviews
+    run in the namespace named by `X-Tenant`, so the grant has to live there.
+    """
+    service_account = client.V1ServiceAccount(metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace))
+    role = client.V1Role(
+        metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace),
+        rules=[
+            client.V1PolicyRule(
+                api_groups=[EVALHUB_API_GROUP],
+                resources=list(TENANT_API_RESOURCES),
+                verbs=TENANT_API_VERBS,
+            ),
+            # A job submission also asks for the MLflow experiment the run records into.
+            client.V1PolicyRule(
+                api_groups=["mlflow.kubeflow.org"],
+                resources=["experiments"],
+                verbs=["create", "get"],
+            ),
+        ],
+    )
+    binding = client.V1RoleBinding(
+        metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace),
+        role_ref=client.V1RoleRef(api_group="rbac.authorization.k8s.io", kind="Role", name=name),
+        subjects=[client.RbacV1Subject(kind="ServiceAccount", name=name, namespace=tenant_namespace)],
+    )
+    for create, body, replace in (
+        (
+            core_client.create_namespaced_service_account,
+            service_account,
+            core_client.replace_namespaced_service_account,
+        ),
+        (rbac_client.create_namespaced_role, role, rbac_client.replace_namespaced_role),
+        (rbac_client.create_namespaced_role_binding, binding, rbac_client.replace_namespaced_role_binding),
+    ):
+        kind = body.kind
+        try:
+            create(namespace=tenant_namespace, body=body)
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            replace(name=body.metadata.name, namespace=tenant_namespace, body=body)
+        LOGGER.info("ensured %s %s/%s", kind, tenant_namespace, body.metadata.name)
+    return name
+
+
+def mint_token(context: str, namespace: str, service_account: str, duration: str = TENANT_TOKEN_DURATION) -> str:
+    """Mint a bearer token for a ServiceAccount, the way a user would."""
+    command = [
+        kubectl_binary(),
+        "--context",
+        context,
+        "--namespace",
+        namespace,
+        "create",
+        "token",
+        service_account,
+        f"--duration={duration}",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        pytest.fail(f"could not mint a token for {namespace}/{service_account}: {result.stderr.strip()}", pytrace=False)
+    LOGGER.info("minted a token for %s/%s", namespace, service_account)
+    return result.stdout.strip()
+
+
+def api_headers(token: str, tenant: str) -> dict[str, str]:
+    """Headers the proxy authorizes with: a bearer token and the tenant namespace."""
+    return {"Authorization": f"Bearer {token}", "X-Tenant": tenant}
+
+
+def submit_job(base_url: str, headers: dict[str, str], payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+    """Submit an evaluation job and return the resource the server created."""
+    LOGGER.info("submitting job %r with headers %s", payload.get("name"), sorted(headers))
+    response = requests.post(
+        f"{base_url}{EVALHUB_JOBS_PATH}",
+        headers=headers,
+        json=payload,
+        verify=False,
+        timeout=timeout,
+    )
+    if response.status_code not in (200, 201, 202):
+        pytest.fail(
+            f"POST {EVALHUB_JOBS_PATH} answered {response.status_code}: {response.text[:1000]}",
+            pytrace=False,
+        )
+    job = response.json()
+    LOGGER.info("job %s submitted", (job.get("resource") or {}).get("id"))
+    return job
+
+
+def read_job(base_url: str, headers: dict[str, str], job_id: str, timeout: int = 30) -> dict[str, Any]:
+    """Read one evaluation job."""
+    return request("get", f"{base_url}{EVALHUB_JOBS_PATH}/{job_id}", timeout=timeout, headers=headers).json()
+
+
+def wait_for_job(
+    base_url: str,
+    headers: dict[str, str],
+    job_id: str,
+    timeout: int = 900,
+    interval: int = 10,
+) -> dict[str, Any]:
+    """Poll a job until it reaches a terminal state, logging every transition."""
+    deadline = time.monotonic() + timeout
+    last_state = None
+    while True:
+        job = read_job(base_url, headers, job_id)
+        state = (job.get("status") or {}).get("state")
+        if state != last_state:
+            message = ((job.get("status") or {}).get("message") or {}).get("message")
+            LOGGER.info("job %s is %s: %s", job_id, state, message)
+            last_state = state
+        if state in JOB_TERMINAL_STATES:
+            return job
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval)
+    pytest.fail(f"job {job_id} did not reach a terminal state within {timeout}s (last: {last_state})", pytrace=False)
+
+
+def benchmark_result(job: dict[str, Any], benchmark_id: str) -> dict[str, Any]:
+    """The result block for one benchmark, failing with what was reported instead."""
+    results = job.get("results") or {}
+    benchmarks = results.get("benchmarks") or []
+    for benchmark in benchmarks:
+        if benchmark.get("id") == benchmark_id:
+            return benchmark
+    pytest.fail(
+        f"job {((job.get('resource') or {}).get('id'))} reported no result for {benchmark_id!r}; results: {results}",
+        pytrace=False,
+    )

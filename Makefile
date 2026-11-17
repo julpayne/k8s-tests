@@ -5,7 +5,8 @@
 # creates a Kind cluster, builds the workload and module operator images from
 # that checkout, loads them into the cluster, and deploys the module operator
 # pointed at the freshly built workload operator image. The module operator then
-# deploys the workload operator, which deploys EvalHub.
+# deploys the workload operator, which deploys EvalHub. The LLM emulator the
+# adapter checks call as their model is deployed and removed by the tests.
 
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -o pipefail -ec
@@ -37,6 +38,17 @@ MODULE_IMG ?= $(IMAGE_PREFIX)/trustyai-operator-module:$(TAG)
 ENGINE ?=
 
 TRUSTYAI_CR_FILE ?= hack/manifests/trustyai-cr.yaml
+
+# The LLM emulator the checks call as their model is deployed and removed by the
+# pytest fixtures (see utilities/emulator.py), not by this harness. These are the
+# settings those fixtures read; leave them empty to use their defaults.
+EMULATOR_IMG ?=
+EMULATOR_NAMESPACE ?=
+EMULATOR_TOKEN ?=
+
+# Set to 1 to leave everything the run created on the cluster (namespaces, the
+# LLM emulator, the evaluation job) instead of removing it at the end.
+KEEP_RESOURCES ?=
 # EvalHub operand image passed to the workload operator through the module
 # operator's RELATED_IMAGE_ODH_EVAL_HUB_IMAGE. Empty keeps the operator's own
 # pin (quay.io/evalhub/evalhub:latest in its params.env).
@@ -46,7 +58,8 @@ PYTEST_ARGS ?=
 REPORT_FILE ?= reports/report.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
-	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT REPORT_FILE
+	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT REPORT_FILE \
+	EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN KEEP_RESOURCES
 
 .PHONY: help
 help: ## Display this help.
@@ -103,6 +116,10 @@ test: ## Run the pytest suite and write an HTML report.
 		echo "HTML report: $(abspath $(REPORT_FILE))"; \
 		exit $${status:-0}
 
+.PHONY: test-keep
+test-keep: ## Run the suite and leave every resource on the cluster for inspection.
+	$(MAKE) test KEEP_RESOURCES=1
+
 .PHONY: lint
 lint: ## Lint and format-check the Python sources.
 	uv run ruff check .
@@ -114,7 +131,7 @@ fmt: ## Format and autofix the Python sources.
 	uv run ruff check --fix .
 
 .PHONY: status
-status: ## Show the module CR, the operators, EvalHub, and their pods.
+status: ## Show the module CR, the operators, EvalHub, the emulator (if a run left one), and their pods.
 	$(KUBECTL) --context $(KUBE_CONTEXT) get trustyais.components.platform.opendatahub.io --ignore-not-found
 	$(KUBECTL) --context $(KUBE_CONTEXT) -n $(NAMESPACE) get deployment,pods \
 		-l app.kubernetes.io/name=trustyai-operator-module --ignore-not-found
@@ -123,6 +140,8 @@ status: ## Show the module CR, the operators, EvalHub, and their pods.
 	$(KUBECTL) --context $(KUBE_CONTEXT) get evalhubs.trustyai.opendatahub.io -A --ignore-not-found
 	$(KUBECTL) --context $(KUBE_CONTEXT) get deploy,pods -A \
 		-l app=eval-hub --ignore-not-found
+	$(KUBECTL) --context $(KUBE_CONTEXT) -n $(if $(EMULATOR_NAMESPACE),$(EMULATOR_NAMESPACE),$(NAMESPACE)) \
+		get deployment,service,pods -l app=vllm-emulator --ignore-not-found
 
 .PHONY: logs
 logs: ## Tail the module and workload operator logs.

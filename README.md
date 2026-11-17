@@ -98,6 +98,18 @@ platform operator would.
 - `make logs` tails the module operator; the workload operator has its own
   pods in the same namespace (`-l control-plane=trustyai-service-operator`),
   and EvalHub runs as `-l app=eval-hub`.
+- Every instance is named `evalhub` and reconciles every tenant-labelled
+  namespace, including namespaces it did not create, so a `KEEP_RESOURCES` run or
+  an interrupted one leaves an instance that keeps writing to later runs'
+  namespaces. The run grants its own job access under a name the operator does not
+  manage, so it does not depend on who reconciled last, and it logs a warning when
+  it sees more than one instance. Delete what you do not need
+  (`kubectl get evalhubs -A`).
+- The LLM emulator (`vllm-emulator`) is deployed by the fixtures into the
+  namespace under test and removed when the run ends; a job reaches it in-cluster
+  as `vllm-emulator:8000`, which is what the benchmark check submits. While a run
+  is in flight it can be poked at from the host with
+  `kubectl -n system port-forward svc/vllm-emulator 8000`.
 - The EvalHub tests create their own instance with the sqlite database backend,
   since Kind has no PostgreSQL, and mint its `evalhub-tls` certificate and
   `evalhub-service-ca` bundle, which OpenShift's service CA would provide. The
@@ -105,6 +117,60 @@ platform operator would.
   the first `make test` needs network access. `make up EVALHUB_IMG=<ref>` points
   the instances those tests create at another image, for example one built from
   `eval-hub`.
+
+## LLM emulator
+
+The checks that call a model use an emulator: the `vllm_emulator` image, which
+answers OpenAI-shaped `/v1/completions` and `/v1/chat/completions` without a GPU.
+
+The tests own it. `tests/conftest.py` deploys it into the namespace under test
+(and removes it afterwards), so `make up` leaves no emulator behind and a run
+cannot depend on one someone left in the cluster. The image, namespace, port and
+token are parameters:
+
+```sh
+make test                                  # default emulator, namespace and token
+make test EMULATOR_NAMESPACE=my-ns         # somewhere else
+make test EMULATOR_IMG=quay.io/.../vllm_emulator:<tag>
+make test EMULATOR_TOKEN=another-token
+```
+
+The emulator image has no notion of credentials, so the fixture mounts a wrapper
+over it from a ConfigMap (`hack/emulator/auth_emulator.py`) and starts that
+instead. Every `/v1` request must then carry `Authorization: Bearer <token>`,
+where the token is the `api-key` entry of the `vllm-emulator-auth` Secret - the
+key an EvalHub job's `model.auth.secret_ref` resolves. `/health` and
+`/__auth/state` stay open: the first is the probe, the second reports how many
+requests were authenticated or rejected and the fingerprints of the tokens that
+arrived (never the tokens), so a check can tell a forwarded credential from a
+dropped one.
+
+## Benchmark job
+
+`tests/test_evalhub_benchmark.py` submits one real evaluation job through the
+EvalHub API and reads its results:
+
+- a ServiceAccount in a tenant namespace, granted the API by the RBAC the proxy
+  authorizes against, minted as a bearer token by `kubectl create token`;
+- a `model.auth.secret_ref` Secret in that namespace carrying `api-key`, the
+  emulator's token;
+- the instance certificate copied into the tenant's `evalhub-service-ca`
+  ConfigMap, which OpenShift's service CA would fill in and Kind cannot, so the
+  evaluation sidecar can verify the instance it reports back to;
+- the `arc_easy` benchmark of the `lm_evaluation_harness` provider with
+  `num_examples: 1`, against the emulator's in-cluster URL.
+
+The job runs in the cluster: the adapter container calls the model through the
+EvalHub sidecar, which injects the credential. The checks assert the job reaches
+`completed`, that `results.benchmarks[0]` carries the benchmark id, provider and
+numeric metrics, and that the emulator saw the tenant Secret's token on a `/v1`
+path. The first run of the day is the slow one - the adapter image has to be pulled and
+the job scheduled (about six minutes on a cold Kind node); afterwards the run is
+about a minute. It is marked `benchmark`, so it can be filtered out:
+
+```sh
+make test PYTEST_ARGS="-m 'not benchmark'"
+```
 
 ## Pytest suite
 
@@ -117,6 +183,8 @@ operators.
 | `tests/test_trustyai_operators.py` | the harness smoke checks: both operator Deployments exist, ask for a single replica, and are healthy (`Available`, the desired replicas ready, their pods `Running` with every container ready) |
 | `tests/test_trustyai_module.py` | the modular stack: the module CRD is installed, both operator Deployments are available, `TrustyAI/default-trustyai` reports `Ready=True` with `ProvisioningSucceeded=True` and an up-to-date `observedGeneration`, and the module operator runs the built image |
 | `tests/test_trustyai_workload.py` | the workload operator image: it matches the `RELATED_IMAGE_*` value the module operator renders it from, the image the harness built, and the operator's own ConfigMap |
+| `tests/test_emulator.py` | the LLM emulator: its Deployment runs the pinned image and is healthy, `/health` needs no token, `/v1/completions` and `/v1/chat/completions` answer `401` without the token or with another one and `200` with the token from the `vllm-emulator-auth` Secret, that Secret carries the `api-key` key `model.auth.secret_ref` resolves, and the token check reports which token fingerprint it saw |
+| `tests/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and the emulator saw the tenant Secret's token on a `/v1` request |
 | `tests/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
 
 Select one area with the markers:
@@ -125,6 +193,8 @@ Select one area with the markers:
 make test PYTEST_ARGS="-m module"                          # the modular stack
 make test PYTEST_ARGS="-m workload"                        # the workload operator
 make test PYTEST_ARGS="-m evalhub"                         # the EvalHub instance
+make test PYTEST_ARGS="-m emulator"                        # the LLM emulator
+make test PYTEST_ARGS="-m benchmark"                       # the benchmark job
 ```
 
 Checks that need an OLM-managed or platform-managed install are deliberately
@@ -146,6 +216,40 @@ make test                                                  # default target
 make test PYTEST_ARGS="-v"                                 # extra pytest flags
 KUBE_CONTEXT=my-cluster NAMESPACE=opendatahub make test     # another cluster
 ```
+
+### Keeping the resources
+
+By default the fixtures remove what they created. Set `KEEP_RESOURCES=1` - or run
+`make test-keep`, or pass `--keep-resources` through `PYTEST_ARGS` - to leave it
+all in place and look at it afterwards:
+
+```sh
+make test KEEP_RESOURCES=1
+kubectl -n "$(kubectl get ns -o name | grep trustyai-evalhub | head -1 | cut -d/ -f2)" get all,cm,evalhubs,jobs
+kubectl -n system get deploy,svc,cm,secret -l app=vllm-emulator
+```
+
+That keeps the EvalHub instance and its tenant namespace, the LLM emulator and its
+Secret and wrapper ConfigMap, and the evaluation job with its spec ConfigMap, its
+pod and the adapter logs. The run logs each namespace it leaves behind and the HTML
+report says so too. Nothing is kept silently: with the default setting the same
+resources are removed at the end of the session.
+
+> **Warning: kept resources affect later runs.** Every EvalHub instance is named
+> `evalhub` and reconciles *every* tenant-labelled namespace, including namespaces
+> it did not create, so a kept instance keeps writing into a later run's tenant
+> namespace. The run grants its own job access, so a re-run still passes, but the
+> namespaces pile up, the kept instance competes for the same tenant resources, and
+> the emulator keeps its port in the namespace under test. Delete the leftovers
+> before a run you want to be clean:
+>
+> ```sh
+> kubectl get ns -o name | grep trustyai-evalhub | xargs -r kubectl delete ns
+> kubectl -n system delete deploy,svc -l app=vllm-emulator
+> kubectl -n system delete cm/vllm-emulator-auth-script secret/vllm-emulator-auth
+> ```
+>
+> The run repeats this warning at start-up whenever `KEEP_RESOURCES` is set.
 
 Runs are verbose by design: at INFO level the suite logs the target context and
 server version, the image each operator runs, replica and condition details, and
