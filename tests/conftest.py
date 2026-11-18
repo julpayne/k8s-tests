@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import shutil
@@ -15,7 +14,6 @@ from typing import Any
 
 import pytest
 from kubernetes import client
-from kubernetes.client.exceptions import ApiException
 from kubernetes.dynamic import DynamicClient
 
 from utilities.emulator import (
@@ -23,6 +21,7 @@ from utilities.emulator import (
     deploy_emulator,
     emulator_name,
     emulator_port,
+    model_url,
     read_credential,
     remove_emulator,
 )
@@ -47,6 +46,14 @@ from utilities.evalhub import (
     wait_for_tenant_rbac,
 )
 from utilities.kube import keep_resources, mint_token, wait_for_deployment_available
+from utilities.model import (
+    MODEL_CREDENTIALS_SECRET,
+    ModelEndpoint,
+    ensure_model_credentials,
+    external_model_key,
+    external_model_url,
+    model_name,
+)
 from utilities.portforward import port_forward
 from utilities.trustyai import MODULE_CRD_NAME, MODULE_OPERATOR_DEPLOYMENT, crd_exists, deployment_exists
 from utilities.trustyai_service import (
@@ -72,6 +79,10 @@ LOGGER = logging.getLogger(__name__)
 # Set by `make test TRUSTYAI_SERVICE_IMG=...`: the operand image the operator was
 # told to deploy, which the checks then confirm the Deployment actually runs.
 SERVICE_IMG_VAR = "TRUSTYAI_SERVICE_IMG"
+
+# The Secret a job's `model.auth.secret_ref` names when the checks use the
+# emulator's credential rather than MODEL_KEY.
+EMULATOR_TENANT_SECRET = "emulator-credentials"
 
 
 @pytest.fixture(scope="session")
@@ -181,7 +192,11 @@ def emulator(
 
     The checks own it, the way they own the EvalHub instance: the namespace, image,
     port and token are parameters, and nothing is left behind in the cluster.
+    When MODEL_URL points the checks at a real endpoint there is nothing to
+    deploy, so the emulator checks skip instead.
     """
+    if external_model_url():
+        pytest.skip("MODEL_URL is set, so the checks call that endpoint; the LLM emulator is not deployed")
     deployment = deploy_emulator(core_client, apps_client, emulator_namespace)
     try:
         yield deployment
@@ -217,6 +232,38 @@ def emulator_url(kube_context: str, emulator_namespace: str, emulator: client.V1
         emulator_port(),
     ) as url:
         yield url
+
+
+@pytest.fixture(scope="session")
+def model_endpoint(request: pytest.FixtureRequest) -> ModelEndpoint:
+    """The endpoint the benchmark jobs call, and the credential it needs.
+
+    MODEL_URL selects a real endpoint, in which case the fixtures deploy no
+    emulator. Without it the jobs call the emulator, whose token is the
+    credential and whose `/__auth/state` endpoint can prove the job reached it.
+    MODEL_KEY, when set, is the credential in either case.
+    """
+    url = external_model_url()
+    key = external_model_key()
+    if url:
+        LOGGER.info("using the real model endpoint %s", url)
+        return ModelEndpoint(
+            url=url,
+            name=model_name(),
+            auth_secret_name=MODEL_CREDENTIALS_SECRET if key else None,
+            credential=key,
+        )
+    credentials = request.getfixturevalue("emulator_credentials")
+    state_url = request.getfixturevalue("emulator_url")
+    secret_name = MODEL_CREDENTIALS_SECRET if key else EMULATOR_TENANT_SECRET
+    return ModelEndpoint(
+        url=model_url(emulator_namespace_from_env()),
+        name=model_name(),
+        auth_secret_name=secret_name,
+        credential=credentials,
+        observes_requests=True,
+        state_url=state_url,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -285,25 +332,25 @@ def evalhub_model_credentials(
     core_client: client.CoreV1Api,
     evalhub_tenant_namespace: str,
     evalhub_tenant_ca: None,
-    emulator_credentials: str,
-) -> str:
+    model_endpoint: ModelEndpoint,
+) -> str | None:
     """The model credential Secret a job's `model.auth.secret_ref` points at.
 
-    `api-key` is the key EvalHub resolves, and its value is the token the emulator
-    requires, so a job can only reach the model if the credential is forwarded.
+    `api-key` is the key EvalHub resolves, so the value never enters the job
+    payload. With MODEL_KEY set the Secret has the known name
+    `model-credentials`; against the emulator without MODEL_KEY it carries the
+    emulator's token. An endpoint that needs no credential gets no Secret, and
+    the job carries no `model.auth` block.
     """
-    name = "emulator-credentials"
-    body = client.V1Secret(
-        metadata=client.V1ObjectMeta(name=name, namespace=evalhub_tenant_namespace),
-        data={"api-key": base64.b64encode(emulator_credentials.encode()).decode()},
+    if not model_endpoint.auth_secret_name or not model_endpoint.credential:
+        LOGGER.info("the model endpoint needs no credential; the job will omit model.auth")
+        return None
+    return ensure_model_credentials(
+        core_client,
+        evalhub_tenant_namespace,
+        model_endpoint.auth_secret_name,
+        model_endpoint.credential,
     )
-    try:
-        core_client.create_namespaced_secret(namespace=evalhub_tenant_namespace, body=body)
-    except ApiException as exc:
-        if exc.status != 409:
-            raise
-        core_client.replace_namespaced_secret(name=name, namespace=evalhub_tenant_namespace, body=body)
-    return name
 
 
 # --- the TrustyAI service --------------------------------------------------

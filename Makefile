@@ -46,6 +46,16 @@ EMULATOR_IMG ?=
 EMULATOR_NAMESPACE ?=
 EMULATOR_TOKEN ?=
 
+# A real model endpoint the job checks call instead of the emulator. MODEL_URL is
+# an OpenAI-compatible base URL (for example http://model:8000/v1); when it is set
+# the fixtures deploy no emulator. MODEL_KEY, when set, becomes the `api-key`
+# entry of the `model-credentials` Secret the fixtures create in the tenant
+# namespace, which the job names in model.auth.secret_ref. MODEL_NAME overrides
+# the model name a job submits.
+MODEL_URL ?=
+MODEL_KEY ?=
+MODEL_NAME ?=
+
 # Set to 1 to leave everything the run created on the cluster (namespaces, the
 # LLM emulator, the evaluation job) instead of removing it at the end.
 KEEP_RESOURCES ?=
@@ -67,7 +77,7 @@ REPORT_FILE ?= reports/report.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
 	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG TRUSTYAI_SERVICE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT \
-	REPORT_FILE EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN KEEP_RESOURCES
+	REPORT_FILE EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN MODEL_URL MODEL_KEY MODEL_NAME KEEP_RESOURCES
 
 .PHONY: help
 help: ## Display this help.
