@@ -11,8 +11,15 @@ the TrustyAI module and workload operators on it: it builds both operator images
 from a `trustyai-service-operator` checkout, loads them into the cluster, and
 deploys the module operator with its image values overridden to the images it
 just built. The module operator then renders and deploys the workload operator
-from the manifests baked into its image. The harness stops there: EvalHub
-instances are created by the tests, so the instance lifecycle is under test.
+from the manifests baked into its image.
+
+The harness stops at the operators: `make up` also creates the `TrustyAI` module
+resource, which makes the module operator deploy the workload operator, and waits
+until both are running the images it built. The resource is built in Python rather
+than from a manifest, so no YAML in this repository has to be kept in step with the
+operator. What the checks then look at - `TrustyAIService`, `EvalHub` instances, the
+jobs that call a model - is created by the suite, the way a user would, so the
+operand lifecycle is under test.
 
 ### Prerequisites
 
@@ -20,7 +27,8 @@ instances are created by the tests, so the instance lifecycle is under test.
   tokens with `kubectl create token`
 - `podman` or `docker` to build the images
 - `uv`, which resolves the pinned Python 3.11+ dependencies from `uv.lock` for
-  `make test`, `make test-evalhub-adapters`, `make lint` and `make fmt`
+  `make deploy`, `make test`, `make test-evalhub-adapters`, `make lint` and
+  `make fmt`
 - `python3` with the [`cryptography`][cryptography] package, which `make deploy`
   runs `hack/gen-certs.py` with to create the TLS secrets Kind does not issue
 - a `trustyai-service-operator` checkout, passed as `OPERATOR_REPO`
@@ -31,8 +39,8 @@ instances are created by the tests, so the instance lifecycle is under test.
 
 ```sh
 make up OPERATOR_REPO=/path/to/trustyai-service-operator
-make status
-make test       # pytest checks against what was just deployed
+make status     # both operators, and no operands
+make test       # creates the operands and checks them
 ```
 
 `make up` is the four steps below, run in order; each is also usable on its own:
@@ -63,16 +71,101 @@ cluster.
    image the workload operator resolves (`RELATED_IMAGE_ODH_EVAL_HUB_IMAGE`,
    when `EVALHUB_IMG` is set) and the namespace are all overridden without
    touching the checkout.
-4. Waits for the module operator, seeds the `Prometheus` instance it expects,
-   and creates the webhook and metrics TLS secrets that OpenShift's service CA
-   would normally issue (Kind has no service CA).
-5. Applies the TrustyAI module resource (`hack/manifests/trustyai-cr.yaml`),
-   waits for the workload operator it deploys, and points the conversion
-   webhooks of the `TrustyAIService` and `EvalHub` CRDs at the seeded CA.
+4. Waits for the module operator to come up, seeds the `Prometheus` instance it
+   expects, and creates the webhook and metrics TLS secrets that OpenShift's
+   service CA would normally issue (Kind has no service CA).
+5. Applies the `TrustyAI` module resource from `utilities/stack.py`, which builds
+   it in Python - there is no manifest - and waits for the workload operator the
+   module operator deploys from it: the Deployment, the image it runs and the
+   `RELATED_IMAGE_*` values it resolves, and its rollout.
+6. Points the `TrustyAIService` and `EvalHub` CRD conversion webhooks at the seeded
+   CA, which OpenShift's service CA would fill in.
 
-It deliberately deploys no EvalHub instance: `tests/test_evalhub.py` creates the
-instance, its namespace and its TLS material itself, the way a user or the
-platform operator would.
+That is where the harness stops: both operators run, with the images this run asked
+for, and nothing is reconciled on top of them. `make status` right after `make up`
+shows the two operators and no operands.
+
+### The module resource and the operands
+
+The module resource is built by `utilities/trustyai.py:module_manifest`:
+`default-trustyai`, `managementState: Managed`, with TAS, LMES, EvalHub and NeMo
+Guardrails enabled. `make deploy` applies it through `utilities/stack.py`; the
+`trustyai_module` fixture in `tests/conftest.py` then adopts it rather than
+rewriting it, and only creates it when the cluster has none - a cluster brought up
+without `make deploy`, which is also the only case where the session deletes it
+again (unless `KEEP_RESOURCES` is set). A resource that is already there, on a
+platform-managed install for instance, is never touched.
+
+Those four are the harness's *capability*, not a list of what is covered: the
+module resource is a cluster-scoped singleton whose `enabledServices` becomes the
+workload operator's `--enable-services` argument, with every controller in that one
+manager process, so a service can only be switched on here. All four are on so a
+check can create whatever operand it needs, in a namespace of its own - the way
+`opendatahub-tests` does - rather than because a check exists for each today.
+
+Everything on top of the operators is created by the suite, the way a user or the
+platform operator would, so there is no manifest for any of it:
+
+- an `EvalHub` instance with its namespace and TLS material, and a
+  `TrustyAIService`, each in its own namespace from a fixture in `tests/conftest.py`;
+- the LLM emulator, or the model credential Secret when `MODEL_URL`/`MODEL_KEY`
+  name a real endpoint, and the resources a job needs in its tenant namespace.
+
+The fixtures depend on `trustyai_module`, so no operand is created before the
+workload operator that reconciles it is up; the fixture repeats the waits
+`utilities/stack.py` does, which is what makes a bare `make test` - without a fresh
+`make deploy` - wait for a stack someone else brought up instead of racing it.
+
+### Bringing a workload of your own
+
+The operators are the session's, a workload is the check's. Three fixtures make that
+the default shape of a new section, and each removes what it created when the check
+that asked for it finishes:
+
+| Fixture | Gives you |
+| --- | --- |
+| `workload_namespaces(request, prefix=...)` | a namespace for a resource you bring yourself |
+| `trustyai_services(request)` | a `TrustyAIService` in a namespace of its own, waited for, with port-forwards to its API (pass `namespace=` to reuse one) |
+| `evalhub_tenants(request)` | a tenant-labelled namespace for an EvalHub job |
+
+So a section that needs its own copy of something asks for one, in its own
+namespace, instead of sharing the session's:
+
+```python
+@pytest.fixture(scope="module")
+def my_service(
+    request: pytest.FixtureRequest,
+    trustyai_services: Callable[..., ServiceAddress],
+) -> ServiceAddress:
+    """One service for this module; a check that needs a second one asks again."""
+    return trustyai_services(request)
+
+
+def test_an_lmeval_job(request: pytest.FixtureRequest, workload_namespaces, custom_api) -> None:
+    namespace = workload_namespaces(request, prefix="trustyai-lmeval")
+    custom_api.create_namespaced_custom_object(
+        group="trustyai.opendatahub.io",
+        version="v1alpha1",
+        namespace=namespace,
+        plural="lmevaljobs",
+        body={
+            "apiVersion": "trustyai.opendatahub.io/v1alpha1",
+            "kind": "LMEvalJob",
+            "metadata": {"name": "arc-easy", "namespace": namespace},
+            "spec": {"model": "hf", "taskList": {"taskNames": ["arc_easy"]}, "limit": "1", "allowOnline": True},
+        },
+    )
+```
+
+A second `TrustyAIService` does not collide with the first: the forwards ask
+`utilities/portforward.py` for a free port pair, starting at
+`TRUSTYAI_SERVICE_API_PORT`/`TRUSTYAI_SERVICE_HEALTH_PORT` (18443/18080), and give
+them back at teardown. What a check cannot have of its own is a service that is not
+enabled on the module resource: `enabledServices` is the one cluster-wide switch, so
+`LMEvalJob`, `EvalHub` and guardrails workloads work because all four are on. The
+`LMEvalJob` shape above is the operator's own sample
+(`config/samples/lmes_v1alpha1_lmevaljob_dra.yaml`), minus the DRA resource claim;
+a marker of your own belongs in `pyproject.toml` next to the others.
 
 ### Variables
 
@@ -105,6 +198,15 @@ documented under [LLM emulator](#llm-emulator).
 
 ### Notes and troubleshooting
 
+- `make up` leaves both operators running and no operands, so `make status` shows
+  the module operator, the workload operator and no `EvalHub` instance. If the
+  workload operator never appears, the module operator could not reconcile the
+  module resource: `make logs` tails the module operator, and
+  `kubectl get trustyais.components.platform.opendatahub.io default-trustyai -o yaml`
+  shows the conditions it reported.
+- `make deploy` converges the module resource on the services the harness needs, so
+  re-running it resets one that was edited by hand. A test session never does that:
+  it adopts the resource it finds.
 - Image tags other than `latest` are important: `latest` would make Kubernetes
   pull instead of using the image loaded into the node.
 - On hosts without the `docker` CLI the harness exports each image with
@@ -351,11 +453,18 @@ kubectl -n "$(kubectl get ns -o name | grep trustyai-evalhub | head -1 | cut -d/
 kubectl -n system get deploy,svc,cm,secret -l app=vllm-emulator
 ```
 
-That keeps the EvalHub instance and its tenant namespace, the LLM emulator and its
-Secret and wrapper ConfigMap, and the evaluation job with its spec ConfigMap, its
-pod and the adapter logs. The run logs each namespace it leaves behind and the HTML
-report says so too. Nothing is kept silently: with the default setting the same
-resources are removed at the end of the session.
+That keeps the EvalHub instance with its tenant namespace, the LLM emulator with
+its Secret and wrapper ConfigMap, and the evaluation job with its spec ConfigMap,
+its pod and the adapter logs. The run logs each namespace it leaves behind and the
+HTML report says so too. Nothing is kept silently: with the default setting those
+are removed at the end of the session.
+
+The two operators - and the module resource `make up` applied - are not the
+fixtures' to remove: they stay until `make down` deletes the cluster, or until you
+delete the resource, which takes the workload operator and its operands with it.
+A session that had to create the resource itself, because no `make deploy` had run
+on that cluster, does delete it again, and a later run adopts whatever it finds
+rather than replacing it.
 
 > **Warning: kept resources affect later runs.** Every EvalHub instance is named
 > `evalhub` and reconciles *every* tenant-labelled namespace, including namespaces
@@ -369,6 +478,7 @@ resources are removed at the end of the session.
 > kubectl get ns -o name | grep trustyai-evalhub | xargs -r kubectl delete ns
 > kubectl -n system delete deploy,svc -l app=vllm-emulator
 > kubectl -n system delete cm/vllm-emulator-auth-script secret/vllm-emulator-auth
+> kubectl delete trustyais.components.platform.opendatahub.io default-trustyai
 > ```
 >
 > The run repeats this warning at start-up whenever `KEEP_RESOURCES` is set.
@@ -399,13 +509,19 @@ or context skips the suite; a missing Deployment fails with a pointer to
 Layout:
 
 - `tests/` — test modules, one file per area; `tests/conftest.py` holds the
-  fixture that skips the module checks when a cluster does not run the modular
-  stack
+  fixtures that own the operands: `trustyai_module` ensures the module resource is
+  there and waits for the workload operator under it, the EvalHub instance and the
+  LLM emulator are the session's, and `workload_namespaces`, `trustyai_services` and
+  `evalhub_tenants` are factories a check uses for a workload of its own
 - `utilities/` — helpers shared by the tests; `utilities/kube.py` loads the
   clients and turns Deployment and pod status into readable failures,
-  `utilities/trustyai.py` holds the module, workload and image helpers, and
-  `utilities/model.py` chooses the model endpoint (`MODEL_URL`/`MODEL_KEY`) and
-  writes the credential Secret it resolves
+  `utilities/trustyai.py` builds the module resource and waits for the stack
+  under it, `utilities/stack.py` runs those steps for `make deploy`,
+  `utilities/trustyai_service.py` owns the whole `TrustyAIService` workload
+  lifecycle, `utilities/portforward.py` hands out local ports for the forwards,
+  `utilities/model.py` chooses the model endpoint (`MODEL_URL` and `MODEL_KEY`)
+  and writes the credential Secret it resolves, and the other modules hold the
+  per-component helpers
 - `conftest.py` — session fixtures for the context, namespace and API clients
 - `pyproject.toml` — the dependencies (`kubernetes`, `pytest`, `requests`,
   `cryptography`) with the `pytest-html` and `ruff` dev group, the marker
