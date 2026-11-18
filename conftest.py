@@ -122,6 +122,18 @@ def api_client(core_client: client.CoreV1Api) -> client.ApiClient:
 
 
 @pytest.fixture(scope="session")
+def custom_api(api_client: client.ApiClient) -> client.CustomObjectsApi:
+    """Client for the custom resources the tests create and read."""
+    return client.CustomObjectsApi(api_client)
+
+
+@pytest.fixture(scope="session")
+def rbac_client(api_client: client.ApiClient) -> client.RbacAuthorizationV1Api:
+    """Client for the Roles and RoleBindings the API checks grant."""
+    return client.RbacAuthorizationV1Api(api_client)
+
+
+@pytest.fixture(scope="session")
 def dynamic_client(api_client: client.ApiClient) -> DynamicClient:
     """Dynamic client for custom resources the typed clients do not model."""
     return DynamicClient(api_client)
@@ -159,15 +171,16 @@ def report_target(clients: tuple[client.CoreV1Api, client.AppsV1Api], kube_conte
 
 # --- report grouping -------------------------------------------------------
 #
-# Every test carries an `evalhub`, `emulator`, `module` or `workload` marker. The run is
+# Every test carries an `evalhub`, `emulator`, `module`, `service` or `workload` marker. The run is
 # ordered by them so the HTML report reads as one block per component, with a
 # Scope column naming the block its first row starts.
 
-SCOPE_MARKERS = ("evalhub", "emulator", "module", "workload")
+SCOPE_MARKERS = ("evalhub", "emulator", "module", "service", "workload")
 SCOPE_TITLES = {
     "evalhub": "EvalHub",
     "emulator": "LLM emulator",
     "module": "Module operator",
+    "service": "TrustyAI service",
     "workload": "Workload operator",
 }
 SCOPE_UNMARKED = "other"

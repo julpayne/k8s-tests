@@ -53,13 +53,21 @@ KEEP_RESOURCES ?=
 # operator's RELATED_IMAGE_ODH_EVAL_HUB_IMAGE. Empty keeps the operator's own
 # pin (quay.io/evalhub/evalhub:latest in its params.env).
 EVALHUB_IMG ?=
+
+# TrustyAI service operand image passed through
+# RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE. The operator's ODH overlay pins
+# quay.io/opendatahub/trustyai-service:latest, which is the retired Java service:
+# it mounts a serving key the current deployment template no longer provides and
+# crash-loops on /etc/tls/internal/tls.crt. The default here is the Python
+# rewrite the operator is written for; set it to a build under test to override.
+TRUSTYAI_SERVICE_IMG ?= quay.io/trustyai/trustyai-service:latest
 TIMEOUT ?= 300s
 PYTEST_ARGS ?=
 REPORT_FILE ?= reports/report.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
-	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT REPORT_FILE \
-	EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN KEEP_RESOURCES
+	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG TRUSTYAI_SERVICE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT \
+	REPORT_FILE EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN KEEP_RESOURCES
 
 .PHONY: help
 help: ## Display this help.

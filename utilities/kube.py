@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import time
 
 import pytest
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
 from kubernetes.config.config_exception import ConfigException
+
+from utilities.portforward import kubectl_binary
 
 DEFAULT_CONTEXT = "kind-trustyai"
 DEFAULT_NAMESPACE = "system"
@@ -18,6 +21,9 @@ DEFAULT_NAMESPACE = "system"
 # then leave what they created on the cluster for inspection.
 KEEP_RESOURCES_VAR = "KEEP_RESOURCES"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Lifetime of the bearer tokens the API checks mint for a ServiceAccount.
+TOKEN_DURATION = "1h"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -231,3 +237,23 @@ def wait_for_deployment_available(
         f"deployment {namespace}/{name} did not become available within {timeout}s: {_describe_conditions(deployment)}",
         pytrace=False,
     )
+
+
+def mint_token(context: str, namespace: str, service_account: str, duration: str = TOKEN_DURATION) -> str:
+    """Mint a bearer token for a ServiceAccount, the way a user would."""
+    command = [
+        kubectl_binary(),
+        "--context",
+        context,
+        "--namespace",
+        namespace,
+        "create",
+        "token",
+        service_account,
+        f"--duration={duration}",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        pytest.fail(f"could not mint a token for {namespace}/{service_account}: {result.stderr.strip()}", pytrace=False)
+    LOGGER.info("minted a token for %s/%s", namespace, service_account)
+    return result.stdout.strip()

@@ -1,5 +1,7 @@
 # k8s-tests
 
+[![Python lint](https://github.com/trustyai-explainability/k8s-tests/actions/workflows/python-lint.yaml/badge.svg?branch=main)](https://github.com/trustyai-explainability/k8s-tests/actions/workflows/python-lint.yaml)
+
 Kubernetes-level tests and harnesses for the TrustyAI components.
 
 ## Local Kind harness
@@ -79,6 +81,7 @@ platform operator would.
 | `WORKLOAD_IMG` | `localhost/trustyai-service-operator:dev` | Workload operator image reference |
 | `MODULE_IMG` | `localhost/trustyai-operator-module:dev` | Module operator image reference |
 | `EVALHUB_IMG` | *(empty)* | EvalHub operand image; empty keeps the operator's own pin (`quay.io/evalhub/evalhub:latest`) |
+| `TRUSTYAI_SERVICE_IMG` | `quay.io/trustyai/trustyai-service:latest` | TrustyAI service operand image, passed through `RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE`; set it to a build under test |
 | `TAG` | `dev` | Tag used by both image references |
 | `IMAGE_PREFIX` | `localhost` | Registry/repository prefix used by both image references |
 | `ENGINE` | auto | `podman` or `docker`; detected when unset |
@@ -172,6 +175,37 @@ about a minute. It is marked `benchmark`, so it can be filtered out:
 make test PYTEST_ARGS="-m 'not benchmark'"
 ```
 
+## TrustyAI service
+
+`tests/test_trustyai_service.py` creates a `TrustyAIService` itself, waits for
+the operand the workload operator builds from it, and then talks to the API the
+way a user would: through the TLS Service, with a bearer token.
+
+The service image matters, because the operator's ODH manifest pins
+`quay.io/opendatahub/trustyai-service:latest`, the retired Java build. That image
+mounts a serving key the current deployment template no longer provides and
+crash-loops on `/etc/tls/internal/tls.crt`. The harness therefore passes
+`TRUSTYAI_SERVICE_IMG` (the Python service by default) through
+`RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE`, and `make test` asserts the
+operand runs exactly that image:
+
+```sh
+make up OPERATOR_REPO=... TRUSTYAI_SERVICE_IMG=quay.io/you/trustyai-service@sha256:...
+```
+
+Three pieces are seeded by the fixtures because the platform supplies them on
+OpenShift and Kind does not: the two serving certificates (`<name>-tls` and
+`<name>-internal`, which the service CA issues from the serving-cert
+annotations), and a ServiceAccount with `get` on the Service, which the proxy's
+SubjectAccessReview checks. The API is reached over a port-forward, so the
+certificate covers `localhost` and the checks verify the chain rather than
+disabling it.
+
+Two conditions the resource reports are platform-only here and asserted as such
+rather than faked: `RouteAvailable` (`RouteNotFound`, since nothing admits the
+Route) and `InferenceServicesPresent` (no model server registers), which is why
+`Ready` stays `False` while the claim and the operand are available.
+
 ## Pytest suite
 
 `tests/` holds the pytest checks that run against a live cluster; they are kept
@@ -185,6 +219,7 @@ operators.
 | `tests/test_trustyai_workload.py` | the workload operator image: it matches the `RELATED_IMAGE_*` value the module operator renders it from, the image the harness built, and the operator's own ConfigMap |
 | `tests/test_emulator.py` | the LLM emulator: its Deployment runs the pinned image and is healthy, `/health` needs no token, `/v1/completions` and `/v1/chat/completions` answer `401` without the token or with another one and `200` with the token from the `vllm-emulator-auth` Secret, that Secret carries the `api-key` key `model.auth.secret_ref` resolves, and the token check reports which token fingerprint it saw |
 | `tests/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and the emulator saw the tenant Secret's token on a `/v1` request |
+| `tests/test_trustyai_service.py` | the TrustyAI service: the CRD serves `v1` and `v1alpha1` through a conversion webhook and a resource created as one reads back as the other; the operand rolls out one replica with the `trustyai-service`, `kube-rbac-proxy` and `internal-tls-proxy` containers, runs the requested image, carries the resource's schedule and storage settings, and mounts a bound claim at the requested size; `/q/health` answers `healthy` unauthenticated; `/info` needs a token and refuses one without the grant; both halves of a drift comparison upload and are counted; CompareMeans detects the shifted distribution; and a scheduled metric is listed once and deleted |
 | `tests/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
 
 Select one area with the markers:

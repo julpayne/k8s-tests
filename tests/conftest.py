@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
+import shutil
+import tempfile
 import uuid
 from collections.abc import Iterator
+from contextlib import ExitStack
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,18 +40,38 @@ from utilities.evalhub import (
     evalhub_api_version,
     grant_tenant_job_access,
     instance_tls_cert,
-    mint_token,
     release_namespace,
     seed_instance_tls,
     seed_tenant_ca,
     wait_for_evalhub_condition,
     wait_for_tenant_rbac,
 )
-from utilities.kube import keep_resources, wait_for_deployment_available
+from utilities.kube import keep_resources, mint_token, wait_for_deployment_available
 from utilities.portforward import port_forward
 from utilities.trustyai import MODULE_CRD_NAME, MODULE_OPERATOR_DEPLOYMENT, crd_exists, deployment_exists
+from utilities.trustyai_service import (
+    HEALTH_SERVICE,
+    HEALTH_SERVICE_PORT,
+    IDENTITY_NAME,
+    INTERNAL_SECRET_SUFFIX,
+    SERVICE_NAME,
+    TLS_SECRET_SUFFIX,
+    TLS_SERVICE_PORT,
+    TLS_SERVICE_SUFFIX,
+    ServiceAddress,
+    create_service,
+    ensure_identity,
+    ensure_serving_secret,
+    forwarded_api_port,
+    forwarded_health_port,
+    wait_for_operand,
+)
 
 LOGGER = logging.getLogger(__name__)
+
+# Set by `make test TRUSTYAI_SERVICE_IMG=...`: the operand image the operator was
+# told to deploy, which the checks then confirm the Deployment actually runs.
+SERVICE_IMG_VAR = "TRUSTYAI_SERVICE_IMG"
 
 
 @pytest.fixture(scope="session")
@@ -279,3 +304,93 @@ def evalhub_model_credentials(
             raise
         core_client.replace_namespaced_secret(name=name, namespace=evalhub_tenant_namespace, body=body)
     return name
+
+
+# --- the TrustyAI service --------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def trustyai_service_namespace(core_client: client.CoreV1Api) -> Iterator[str]:
+    """Namespace holding the TrustyAIService the checks create, removed afterwards."""
+    name = f"trustyai-service-{uuid.uuid4().hex[:6]}"
+    create_namespace(core_client, name)
+    try:
+        yield name
+    finally:
+        release_namespace(core_client, name)
+
+
+@pytest.fixture(scope="session")
+def trustyai_service_image() -> str:
+    """The operand image the workload operator was told to deploy, if the run named one."""
+    return os.environ.get(SERVICE_IMG_VAR, "")
+
+
+@pytest.fixture(scope="session")
+def trustyai_service(
+    core_client: client.CoreV1Api,
+    apps_client: client.AppsV1Api,
+    rbac_client: client.RbacAuthorizationV1Api,
+    custom_api: client.CustomObjectsApi,
+    kube_context: str,
+    trustyai_service_namespace: str,
+) -> Iterator[ServiceAddress]:
+    """Create a TrustyAIService, wait for its operand, and point the checks at its API.
+
+    Two things the platform would provide are seeded first: the serving
+    certificates the proxy mounts (OpenShift's service CA issues them from the
+    serving-cert annotations, which Kind has nothing to act on) and the identity
+    the proxy authorizes. The resource is created only after the certificates
+    exist, because the operand cannot start without them.
+    """
+    namespace = trustyai_service_namespace
+    ca_dir = Path(tempfile.mkdtemp(prefix="trustyai-service-ca-"))
+    ca_file = ca_dir / "ca.crt"
+    ca_file.write_bytes(
+        ensure_serving_secret(core_client, namespace, f"{SERVICE_NAME}{TLS_SECRET_SUFFIX}", SERVICE_NAME)
+    )
+    # The operator mounts a second certificate into the internal proxy; nothing on
+    # Kind issues it either.
+    ensure_serving_secret(core_client, namespace, f"{SERVICE_NAME}{INTERNAL_SECRET_SUFFIX}", SERVICE_NAME)
+    ensure_identity(core_client, rbac_client, namespace, SERVICE_NAME)
+    token = mint_token(kube_context, namespace, IDENTITY_NAME)
+
+    create_service(custom_api, namespace, SERVICE_NAME)
+    wait_for_operand(apps_client, namespace)
+    wait_for_deployment_available(apps_client, SERVICE_NAME, namespace, core_client=core_client)
+
+    with ExitStack() as stack:
+        api_url = stack.enter_context(
+            port_forward(
+                kube_context,
+                namespace,
+                f"service/{SERVICE_NAME}{TLS_SERVICE_SUFFIX}",
+                forwarded_api_port(),
+                TLS_SERVICE_PORT,
+                scheme="https",
+            )
+        )
+        health_url = stack.enter_context(
+            port_forward(
+                kube_context,
+                namespace,
+                f"service/{HEALTH_SERVICE}",
+                forwarded_health_port(),
+                HEALTH_SERVICE_PORT,
+            )
+        )
+        # A forward to 127.0.0.1 does not match a Service name, so the checks go
+        # through `localhost`, which the seeded certificate covers.
+        address = ServiceAddress(
+            namespace=namespace,
+            name=SERVICE_NAME,
+            token=token,
+            ca_file=ca_file,
+            api_url=api_url.replace("127.0.0.1", "localhost"),
+            health_url=health_url,
+        )
+        LOGGER.info("TrustyAI service API: %s (verify with %s)", address.api_url, ca_file)
+        try:
+            yield address
+        finally:
+            shutil.rmtree(ca_dir, ignore_errors=True)
