@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the TrustyAI module operator on Kind, overriding the module operator
-# image, the workload operator image it renders, the EvalHub image the workload
-# operator resolves, and the target namespace.
+# image, the workload operator image it renders, the TrustyAI service and EvalHub
+# images the workload operator resolves, and the target namespace.
 #
 # The operators only: EvalHub instances, their namespaces and their TLS material
 # are created by the tests, the way a user or the platform operator would.
@@ -57,6 +57,17 @@ module_env_patch=$(cat <<EOF
           value: $WORKLOAD_IMG
 EOF
 )
+if [[ -n "${TRUSTYAI_SERVICE_IMG:-}" ]]; then
+	module_env_patch+=$(cat <<EOF
+
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE
+          value: $TRUSTYAI_SERVICE_IMG
+EOF
+)
+fi
 if [[ -n "${EVALHUB_IMG:-}" ]]; then
 	module_env_patch+=$(cat <<EOF
 
@@ -92,6 +103,9 @@ EOF
 info "deploying the module operator ($MODULE_IMG) with workload image $WORKLOAD_IMG"
 if [[ -n "${EVALHUB_IMG:-}" ]]; then
 	info "passing EvalHub image $EVALHUB_IMG to the workload operator"
+fi
+if [[ -n "${TRUSTYAI_SERVICE_IMG:-}" ]]; then
+	info "passing TrustyAI service image $TRUSTYAI_SERVICE_IMG to the workload operator"
 fi
 kube apply -k "$workdir" --server-side=true
 
@@ -183,6 +197,12 @@ wait_for_operand_image_env() {
 }
 
 wait_for_workload_image "$WORKLOAD_IMG"
+
+# The TrustyAI service image the workload operator should resolve. The harness
+# always sets it, so an override and a return to the default are both gated.
+if [[ -n "${TRUSTYAI_SERVICE_IMG:-}" ]]; then
+	wait_for_operand_image_env RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE "$TRUSTYAI_SERVICE_IMG"
+fi
 
 # The EvalHub image the workload operator should resolve: the requested one, or
 # the default the module image bakes into params.env. Gating on both directions

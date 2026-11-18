@@ -16,7 +16,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import logging
-import subprocess
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -30,7 +29,6 @@ from kubernetes.dynamic.exceptions import NotFoundError
 
 from utilities.certs import generate_serving_cert, service_dns_names
 from utilities.kube import keep_resources
-from utilities.portforward import kubectl_binary
 from utilities.portforward import port_forward as _forward_port
 
 LOGGER = logging.getLogger(__name__)
@@ -74,7 +72,6 @@ TENANT_JOB_ACCESS_ROLES = (
     "trustyai-service-operator-evalhub-job-config",
     "trustyai-service-operator-evalhub-jobs-writer",
 )
-TENANT_TOKEN_DURATION = "1h"
 TENANT_RBAC_TIMEOUT = 120
 
 CONDITION_READY = "Ready"
@@ -475,26 +472,6 @@ def create_tenant_identity(
             replace(name=body.metadata.name, namespace=tenant_namespace, body=body)
         LOGGER.info("ensured %s %s/%s", kind, tenant_namespace, body.metadata.name)
     return name
-
-
-def mint_token(context: str, namespace: str, service_account: str, duration: str = TENANT_TOKEN_DURATION) -> str:
-    """Mint a bearer token for a ServiceAccount, the way a user would."""
-    command = [
-        kubectl_binary(),
-        "--context",
-        context,
-        "--namespace",
-        namespace,
-        "create",
-        "token",
-        service_account,
-        f"--duration={duration}",
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        pytest.fail(f"could not mint a token for {namespace}/{service_account}: {result.stderr.strip()}", pytrace=False)
-    LOGGER.info("minted a token for %s/%s", namespace, service_account)
-    return result.stdout.strip()
 
 
 def api_headers(token: str, tenant: str) -> dict[str, str]:

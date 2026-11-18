@@ -25,6 +25,7 @@ markers = [
     "benchmark: checks that submit an evaluation job and read its results",
     "module: checks for the TrustyAI module operator and the TrustyAI resource it reconciles",
     "workload: checks for the TrustyAI workload (service) operator",
+    "service: checks for the TrustyAIService resource, its operand and the API behind it",
 ]
 addopts = [
     "-ra",
