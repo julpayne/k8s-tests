@@ -25,6 +25,7 @@ markers = [
     "generation: checks for the collection generation API and the authorization the proxy applies to it",
     "emulator: checks for the LLM emulator and the token it requires",
     "benchmark: checks that submit an evaluation job and read its results",
+    "lmeval: checks for an LMEvalJob: its execution Pod and the NetworkPolicy that guards it",
     "adapters: EvalHub adapters: one real benchmark per job, run as a section of their own",
     "module: checks for the TrustyAI module operator and the TrustyAI resource it reconciles",
     "workload: checks for the TrustyAI workload (service) operator",
