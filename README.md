@@ -286,7 +286,7 @@ dropped one.
 
 ## Benchmark job
 
-`tests/test_evalhub_benchmark.py` submits one real evaluation job through the
+`tests/evalhub/test_evalhub_benchmark.py` submits one real evaluation job through the
 EvalHub API and reads its results:
 
 - a ServiceAccount in a tenant namespace, granted the API by the RBAC the proxy
@@ -323,7 +323,7 @@ make test PYTEST_ARGS="-m 'not benchmark'"
 
 ## EvalHub adapters
 
-`tests/test_evalhub_adapters.py` is the section that runs real benchmarks. Every
+`tests/evalhub/test_evalhub_adapters.py` is the section that runs real benchmarks. Every
 entry in its `BENCHMARKS` table is one adapter run: submitted through the API,
 waited for until the adapter finishes in the cluster, and read back as a result.
 It covers one today, `ethics_cm` (commonsense moral judgment) of the
@@ -342,17 +342,65 @@ pass criteria turn the score into a `test` block; and, when the model is the
 emulator, that it authenticated the job's model requests, so the model was called
 rather than the job merely reporting success.
 
-The section carries the `adapters` marker and nothing else, in both directions:
-the EvalHub instance checks are `evalhub` and never select it, and it never
-selects them. An adapter run costs minutes and fetches its benchmark's dataset
-from the Hub, so `make test` leaves the section out and it runs on its own, with a
-report of its own:
+The section carries `evalhub` and `adapters`: it is part of the EvalHub selection,
+and `adapters` names the section within it. Because an adapter run costs minutes
+and fetches its benchmark's dataset from the Hub, it is the one section the default
+run excludes - `make test` is `-m 'not adapters'` and `make test-evalhub` is
+`-m 'evalhub and not adapters'` - so it is not selected by accident, only by name:
 
 ```sh
 make test-evalhub-adapters                    # only this section, into reports/adapters.html
 make test-evalhub-adapters KEEP_RESOURCES=1   # leave the job, its pod and the adapter logs behind
 make test-all                                 # every section, the adapters included
-make test PYTEST_ARGS="-m adapters"            # the same selection, into the usual report
+make test-select SELECT='-m adapters'         # the same selection, into the usual report
+```
+
+## Collection generation authorization
+
+`tests/evalhub/test_evalhub_collection_generation.py` covers the authorization
+`trustyai-service-operator#1131` added for the collection generation API: `POST
+/api/v1/evaluations/collections/generation` and `GET`/`DELETE
+/api/v1/evaluations/collections/generation/{id}`. kube-rbac-proxy authorizes every
+EvalHub request with a SubjectAccessReview in the namespace the `X-Tenant` header
+names, against a pseudo-resource and verb the operator writes into the `auth.yaml`
+key of the instance's configuration ConfigMap; the checks read that policy from the
+ConfigMap the proxy container actually mounts, and the tenant Role from the tenant
+namespace, so they assert what the cluster runs rather than a copy of it.
+
+Four independent things can regress, and each is checked on its own:
+
+- the policy maps both generation entries to `evaluations` (`create` for the
+  POST, `{{.FromMethod}}` for the lifecycle entry) with the `X-Tenant` rewrite,
+  declares each path once, and maps nothing for the removed
+  `.../generation/models` endpoint;
+- the generation entries are declared **before** the generic
+  `/api/v1/evaluations/collections/*` entry, which also maps `get` and `delete`:
+  kube-rbac-proxy uses the first endpoint that matches, so the other order would
+  authorize a generation request as a collection. The check reads the wildcard's
+  methods and states the overlap rather than assuming it, so it reports when the
+  ordering stops mattering;
+- the pod template's `auth.yaml` digest annotation describes the policy the
+  container mounts, so a pod is never running one policy while a later reconcile
+  has already replaced the ConfigMap under it;
+- the tenant-user Role the operator writes keeps the lifecycle inside
+  `evaluations`: it grants `get`, `create` and `delete` there and no collection
+  write, so generating a collection does not hand the tenant the right to write
+  one.
+
+The API checks then call the three paths through the port-forward as an identity
+granted exactly those tenant-user rules, whose only `collections` verbs are `get`,
+`list` and `watch`. That is what makes them discriminating: a `DELETE` or a `POST`
+that fell through to the generic collections entry would ask for a `collections`
+verb the identity does not have and the proxy would answer `403`. They also assert
+the paths need a token, unlike the health path, and that the same token is refused
+when `X-Tenant` names a namespace it has no grant in. The section carries the
+`generation` marker as well as `evalhub`, so it stays in the EvalHub block of the
+report and can be selected on its own:
+
+```sh
+make test-evalhub-generation                  # this section only
+make test-select SELECT='-m generation'       # the same, spelled as a selection
+make test-select SELECT='-k tenant_role'      # or one check of it, by name
 ```
 
 ## TrustyAI service
@@ -398,25 +446,48 @@ operators.
 | `tests/test_trustyai_module.py` | the modular stack: the module CRD is installed, both operator Deployments are available, `TrustyAI/default-trustyai` reports `Ready=True` with `ProvisioningSucceeded=True` and an up-to-date `observedGeneration`, and the module operator runs the built image |
 | `tests/test_trustyai_workload.py` | the workload operator image: it matches the `RELATED_IMAGE_*` value the module operator renders it from, the image the harness built, and the operator's own ConfigMap |
 | `tests/test_emulator.py` | the LLM emulator (skipped when `MODEL_URL` is set): its Deployment runs the pinned image and is healthy, `/health` needs no token, `/v1/completions` and `/v1/chat/completions` answer `401` without the token or with another one and `200` with the token from the `vllm-emulator-auth` Secret, that Secret carries the `api-key` key `model.auth.secret_ref` resolves, and the token check reports which token fingerprint it saw |
-| `tests/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator or `MODEL_URL`, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and - against the emulator - the emulator saw the tenant Secret's token (or `MODEL_KEY`) on a `/v1` request |
-| `tests/test_evalhub_adapters.py` | the EvalHub adapters section (opt-in, `make test-evalhub-adapters`): each benchmark in its table - currently `ethics_cm` of `lm_evaluation_harness`, with `num_examples: 1` against the emulator or `MODEL_URL` - is accepted as the job's only benchmark, reaches `completed`, reports the benchmark, provider, numeric metrics and the `acc` its provider scores it on, turns its pass criteria into a test outcome, and - against the emulator - the emulator authenticated the model requests it made |
+| `tests/evalhub/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator or `MODEL_URL`, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and - against the emulator - the emulator saw the tenant Secret's token (or `MODEL_KEY`) on a `/v1` request |
+| `tests/evalhub/test_evalhub_adapters.py` | the EvalHub adapters section (opt-in, `make test-evalhub-adapters`): each benchmark in its table - currently `ethics_cm` of `lm_evaluation_harness`, with `num_examples: 1` against the emulator or `MODEL_URL` - is accepted as the job's only benchmark, reaches `completed`, reports the benchmark, provider, numeric metrics and the `acc` its provider scores it on, turns its pass criteria into a test outcome, and - against the emulator - the emulator authenticated the model requests it made |
+| `tests/evalhub/test_evalhub_collection_generation.py` | the authorization `trustyai-service-operator#1131` added for the collection generation API: the mounted policy maps `POST /api/v1/evaluations/collections/generation` to `evaluations create` and `GET`/`DELETE .../generation/{id}` to `evaluations` `{{.FromMethod}}`, each declared once with the `X-Tenant` rewrite and ahead of the generic `/api/v1/evaluations/collections/*` entry that also maps `get` and `delete`; the removed `.../generation/models` path has no mapping; the pod template's `auth.yaml` digest describes the policy the container mounts; the tenant-user Role grants `evaluations` `get`/`create`/`delete` and no collection write; and, as an identity granted exactly those rules, all three paths answer through the proxy (not `401`/`403`), need a token, and are refused when `X-Tenant` names a namespace the identity has no grant in |
 | `tests/test_trustyai_service.py` | the TrustyAI service: the CRD serves `v1` and `v1alpha1` through a conversion webhook and a resource created as one reads back as the other; the operand rolls out one replica with the `trustyai-service`, `kube-rbac-proxy` and `internal-tls-proxy` containers, runs the requested image, carries the resource's schedule and storage settings, and mounts a bound claim at the requested size; `/q/health` answers `healthy` unauthenticated; `/info` needs a token and refuses one without the grant; both halves of a drift comparison upload and are counted; CompareMeans detects the shifted distribution; and a scheduled metric is listed once and deleted |
-| `tests/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
+| `tests/evalhub/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
 
-Select one area with the markers:
+Two axes select what runs, and they compose: a **directory** names a component
+(`tests/evalhub`), a **marker** names a section within it (`evalhub`, `benchmark`,
+`adapters`, `generation`, `module`, `service`, `emulator`, `workload`).
+Every module in a component directory carries that component's marker as well as its
+own, so a section is both part of its component and runnable on its own.
 
 ```sh
-make test PYTEST_ARGS="-m module"                          # the modular stack
-make test PYTEST_ARGS="-m workload"                        # the workload operator
-make test PYTEST_ARGS="-m evalhub"                         # the EvalHub instance
-make test PYTEST_ARGS="-m service"                         # the TrustyAI service
-make test PYTEST_ARGS="-m emulator"                        # the LLM emulator
-make test PYTEST_ARGS="-m benchmark"                       # the harness smoke job
-make test-evalhub-adapters                                 # the EvalHub adapters (opt-in, own report)
+make test                                                  # everything except the adapters
+make test-evalhub                                          # all EvalHub checks, adapters excluded
+make test-evalhub-generation                               # just the collection generation authorization
+make test-evalhub-adapters                                 # just the adapter jobs (slow, own report)
+make test-all                                              # everything, adapters included
 ```
 
-`make test` runs every section except the EvalHub adapters, which are opt-in: see
-[EvalHub adapters](#evalhub-adapters).
+Anything else goes through `test-select`, which takes a marker expression, a
+directory, a node id or `-k` - whatever pytest accepts:
+
+```sh
+make test-select SELECT='-m generation'                    # one section
+make test-select SELECT=tests/evalhub                      # one component directory
+make test-select SELECT='-m "evalhub and not adapters"'     # a component without its slow section
+make test-select SELECT='-m "evalhub and not benchmark and not adapters"'
+make test-select SELECT=tests/evalhub/test_evalhub_collection_generation.py
+make test-select SELECT=tests/evalhub/test_evalhub.py::test_evalhub_health_endpoint
+make test-select SELECT='-k tenant_role'                   # one check, by name
+```
+
+For example: `-m module` the modular stack, `-m workload` the workload operator,
+`-m service` the TrustyAI service, `-m emulator` the LLM emulator, `-m benchmark`
+the harness smoke job. The same
+selections run through `make test PYTEST_ARGS=...` when a full run with an extra
+filter is what you want; `test-select` runs only the selection.
+
+`-m evalhub` includes the adapter jobs, because they are EvalHub checks too; they
+are excluded from `make test` and `make test-evalhub` by the `adapters` marker
+rather than by not being marked. See [EvalHub adapters](#evalhub-adapters).
 
 Checks that need an OLM-managed or platform-managed install are deliberately
 absent, because the harness cannot provide one: the `odh-trustyai-config` and
@@ -434,9 +505,6 @@ certificate, because a forwarded port is reached as 127.0.0.1 and the harness
 certificate only covers the in-cluster Service names.
 
 ```sh
-make test                                                  # every section except the adapters
-make test-evalhub-adapters                                 # only the EvalHub adapters
-make test-all                                              # every section
 make test PYTEST_ARGS="-v"                                 # extra pytest flags
 KUBE_CONTEXT=my-cluster NAMESPACE=opendatahub make test     # another cluster
 ```
@@ -491,10 +559,10 @@ failing one says what was not.
 Every run also writes a self-contained HTML report (git-ignored) that keeps the
 captured log and failure detail per test: `reports/report.html` for `make test`
 and `make test-all`, `reports/adapters.html` for `make test-evalhub-adapters`.
-The run is ordered by scope and the report shows it: one block each for EvalHub,
-the EvalHub adapters, the LLM emulator, the module operator, the TrustyAI service
-and the workload operator, a `Scope` column naming the block its first row
-starts, and a per-scope count above the table.
+The run is ordered by scope and the report shows it: one block each for the EvalHub
+adapters, EvalHub, the LLM emulator, the module operator, the TrustyAI service and
+the workload operator, a `Scope` column naming the block its first row starts, and
+a per-scope count above the table.
 
 ```sh
 make test REPORT_FILE=/tmp/trustyai.html                     # choose the report path
@@ -513,6 +581,11 @@ Layout:
   there and waits for the workload operator under it, the EvalHub instance and the
   LLM emulator are the session's, and `workload_namespaces`, `trustyai_services` and
   `evalhub_tenants` are factories a check uses for a workload of its own
+- `tests/evalhub/` — the EvalHub sections in one directory: the instance and its
+  health endpoint, the benchmark job, the adapters, and the collection generation
+  authorization. They share the fixtures in `tests/conftest.py`, and
+  `utilities/evalhub_auth.py` holds the policy and tenant-Role readers the
+  authorization checks use
 - `utilities/` — helpers shared by the tests; `utilities/kube.py` loads the
   clients and turns Deployment and pod status into readable failures,
   `utilities/trustyai.py` builds the module resource and waits for the stack
@@ -524,7 +597,7 @@ Layout:
   per-component helpers
 - `conftest.py` — session fixtures for the context, namespace and API clients
 - `pyproject.toml` — the dependencies (`kubernetes`, `pytest`, `requests`,
-  `cryptography`) with the `pytest-html` and `ruff` dev group, the marker
+  `cryptography`, `pyyaml`) with the `pytest-html` and `ruff` dev group, the marker
   registry, and the `ruff` configuration; `uv.lock` pins them and the make
   targets run them through `uv`
 

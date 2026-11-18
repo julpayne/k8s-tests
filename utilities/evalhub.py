@@ -66,6 +66,22 @@ JOB_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 TENANT_API_RESOURCES = ("evaluations", "providers", "collections", "status-events")
 TENANT_API_VERBS = ["get", "list", "create", "update", "patch", "delete"]
 TENANT_IDENTITY_NAME = "evalhub-api"
+# The rules the operator writes into a tenant namespace for the tenant's own users
+# (controllers/evalhub/tenant_roles.go tenantUserRules): the API's pseudo-resources,
+# with collection reads only. The collection generation API is authorized as
+# `evaluations`, so this is the grant a generation request is checked against, and
+# the reason a request that fell through to the generic collections entry - a
+# DELETE, or a POST - would be refused.
+TENANT_USER_RULES: dict[str, list[str]] = {
+    "evalhubs": ["get", "list"],
+    "evaluations": ["get", "list", "create", "update", "patch", "delete"],
+    "collections": ["get", "list", "watch"],
+    "providers": ["get", "list", "watch"],
+    "status-events": ["create"],
+}
+# The identity the authorization checks act as: the operator's tenant-user grant,
+# so a path the policy maps to a resource or verb that grant lacks is refused.
+TENANT_USER_IDENTITY_NAME = "evalhub-tenant-user"
 # Names the operator does not manage: see grant_tenant_job_access.
 TENANT_JOB_ACCESS_BINDING = "k8s-tests-instance-api-job-access"
 TENANT_JOB_ACCESS_ROLES = (
@@ -280,10 +296,11 @@ def request(
     url: str,
     timeout: int = 10,
     headers: dict[str, str] | None = None,
+    json_body: Any | None = None,
 ) -> requests.Response:
     """Send a request to EvalHub without verifying the certificate the tests minted."""
     LOGGER.info("%s %s", method.upper(), url)
-    return requests.request(method, url, headers=headers, verify=False, timeout=timeout)
+    return requests.request(method, url, headers=headers, json=json_body, verify=False, timeout=timeout)
 
 
 def instance_tls_cert(core_client: client.CoreV1Api, namespace: str, name: str = EVALHUB_NAME) -> bytes:
@@ -426,21 +443,36 @@ def create_tenant_identity(
     rbac_client: client.RbacAuthorizationV1Api,
     tenant_namespace: str,
     name: str = TENANT_IDENTITY_NAME,
+    rules: dict[str, list[str]] | None = None,
 ) -> str:
     """Create the ServiceAccount a tenant's user acts as, and grant it the API.
 
     The API checks call EvalHub as this identity: the proxy's SubjectAccessReviews
     run in the namespace named by `X-Tenant`, so the grant has to live there.
+
+    `rules` narrows the grant to the pseudo-resources named and the verbs listed,
+    which is how a check acts as the tenant-user Role the operator writes rather
+    than as an identity with every verb. The default is the broad grant the EvalHub
+    API checks need.
     """
     service_account = client.V1ServiceAccount(metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace))
-    role = client.V1Role(
-        metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace),
-        rules=[
+    if rules is None:
+        api_rules = [
             client.V1PolicyRule(
                 api_groups=[EVALHUB_API_GROUP],
                 resources=list(TENANT_API_RESOURCES),
                 verbs=TENANT_API_VERBS,
-            ),
+            )
+        ]
+    else:
+        api_rules = [
+            client.V1PolicyRule(api_groups=[EVALHUB_API_GROUP], resources=[resource], verbs=list(verbs))
+            for resource, verbs in rules.items()
+        ]
+    role = client.V1Role(
+        metadata=client.V1ObjectMeta(name=name, namespace=tenant_namespace),
+        rules=[
+            *api_rules,
             # A job submission also asks for the MLflow experiment the run records into.
             client.V1PolicyRule(
                 api_groups=["mlflow.kubeflow.org"],
