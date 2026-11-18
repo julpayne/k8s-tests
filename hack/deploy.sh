@@ -3,8 +3,12 @@
 # image, the workload operator image it renders, the TrustyAI service and EvalHub
 # images the workload operator resolves, and the target namespace.
 #
-# The operators only: EvalHub instances, their namespaces and their TLS material
-# are created by the tests, the way a user or the platform operator would.
+# The operators: the module operator, plus the TrustyAI module resource and the
+# workload operator it deploys from it. Nothing here depends on a manifest checked
+# into this repository - the resource is built in Python. The operands on top of
+# that (EvalHub instances and their namespaces and TLS material, TrustyAIService,
+# the jobs that call a model) are created by the tests, the way a user or the
+# platform operator would.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -141,95 +145,22 @@ if ! kube -n "$NAMESPACE" get secret webhook-server-cert >/dev/null 2>&1; then
 	info "creating the webhook and metrics TLS secrets"
 	create_tls_secrets
 fi
-ca_bundle=$(kube -n "$NAMESPACE" get secret webhook-server-cert -o jsonpath='{.data.tls\.crt}')
 
-info "applying the TrustyAI module resource from $(basename "$TRUSTYAI_CR_FILE")"
-kube apply -f "$TRUSTYAI_CR_FILE"
-
-info "waiting for the module operator to deploy the workload operator"
-for _ in $(seq 1 90); do
-	if kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager >/dev/null 2>&1; then
-		break
-	fi
-	sleep 2
-done
-kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager >/dev/null ||
-	die "the module operator did not create the workload operator deployment"
-
-# The module operator renders the workload operator's pod spec (its image and
-# the RELATED_IMAGE_* values it resolves operands from) from params.env, and it
-# rewrites params.env from its own env only on its next reconcile. Wait for the
-# rendered values here: creating an operand before they land would pin the old
-# image, which is exactly what a re-deploy with a new image would otherwise do.
-wait_for_workload_image() {
-	local want=$1 image=""
-	for _ in $(seq 1 90); do
-		image=$(kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager \
-			-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-		if [[ "$image" == "$want" ]]; then
-			info "workload operator image is $want"
-			return 0
-		fi
-		sleep 2
-	done
-	die "the module operator never rendered the workload operator image $want (last: ${image:-unset})"
-}
-
-wait_for_operand_image_env() {
-	local env_name=$1 want=$2 envs key value got=""
-	for _ in $(seq 1 90); do
-		envs=$(kube -n "$NAMESPACE" get deployment/trustyai-service-operator-controller-manager \
-			-o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null || true)
-		got=""
-		while IFS='=' read -r key value; do
-			if [[ "$key" == "$env_name" ]]; then
-				got=$value
-				break
-			fi
-		done <<<"$envs"
-		if [[ "$got" == "$want" ]]; then
-			info "workload operator resolves $env_name=$want"
-			return 0
-		fi
-		sleep 2
-	done
-	die "the workload operator never rendered $env_name=$want (last: ${got:-unset})"
-}
-
-wait_for_workload_image "$WORKLOAD_IMG"
-
-# The TrustyAI service image the workload operator should resolve. The harness
-# always sets it, so an override and a return to the default are both gated.
-if [[ -n "${TRUSTYAI_SERVICE_IMG:-}" ]]; then
-	wait_for_operand_image_env RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE "$TRUSTYAI_SERVICE_IMG"
-fi
-
-# The EvalHub image the workload operator should resolve: the requested one, or
-# the default the module image bakes into params.env. Gating on both directions
-# keeps a re-deploy without EVALHUB_IMG from leaving an operand pinned to the
-# previously requested image.
-evalhub_want=$EVALHUB_IMG
-if [[ -z "$evalhub_want" ]]; then
-	params_env="$OPERATOR_REPO/trustyai-operator-module/config/manifests-template/base/params.env"
-	if [[ -f "$params_env" ]]; then
-		evalhub_want=$(grep -m1 '^evalHubImage=' "$params_env" | cut -d= -f2- || true)
-	fi
-fi
-if [[ -n "$evalhub_want" ]]; then
-	wait_for_operand_image_env RELATED_IMAGE_ODH_EVAL_HUB_IMAGE "$evalhub_want"
-else
-	warn "could not read the default evalHubImage from params.env; not waiting for the operand image"
-fi
-kube -n "$NAMESPACE" rollout status deployment/trustyai-service-operator-controller-manager \
-	--timeout "$TIMEOUT"
-
-for crd in trustyaiservices.trustyai.opendatahub.io evalhubs.trustyai.opendatahub.io; do
-	if [[ $(kube get crd "$crd" -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null) == Webhook ]]; then
-		kube patch crd "$crd" --type=json \
-			-p="[{\"op\":\"add\",\"path\":\"/spec/conversion/webhook/clientConfig/caBundle\",\"value\":\"$ca_bundle\"}]" \
-			>/dev/null
-		info "patched the $crd conversion webhook CA bundle"
-	fi
-done
+# What `make up` promises also includes the stack under the module operator: the
+# module resource, and the workload operator the module operator deploys from it.
+# Both come from Python (utilities/stack.py, which builds the resource with the
+# helpers the tests use and then waits for the Deployment, the images it renders
+# and the conversion webhooks), so there is no manifest to keep in step with the
+# operator. The operands on top of that - EvalHub instances, TrustyAIService, the
+# jobs that call a model - stay the tests' business.
+command -v uv >/dev/null 2>&1 || die "uv is required to create the TrustyAI module resource; install uv"
+info "applying the TrustyAI module resource and waiting for the workload operator"
+repo_root=$(cd "$here/.." && pwd)
+(
+	cd "$repo_root"
+	KUBE_CONTEXT="$KUBE_CONTEXT" NAMESPACE="$NAMESPACE" uv run --quiet python -m utilities.stack
+)
 
 info "TrustyAI is deployed in namespace $NAMESPACE"
+info "  the module operator and the workload operator it deploys are running"
+info "  its operands are created by the tests: make test"

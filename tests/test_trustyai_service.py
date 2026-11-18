@@ -11,6 +11,7 @@ reports it, not faked.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import pytest
 import requests
@@ -49,6 +50,21 @@ from utilities.trustyai_service import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="module")
+def trustyai_service(
+    request: pytest.FixtureRequest,
+    trustyai_services: Callable[..., ServiceAddress],
+) -> ServiceAddress:
+    """The service this module checks, created the way any check can create its own.
+
+    `trustyai_services` gives each caller a workload with a namespace of its own; this
+    module asks for one and reuses it, because the operand takes minutes to roll out
+    and every check here looks at the same one. A check that needs a second service -
+    a second namespace, a different spec - calls the fixture again.
+    """
+    return trustyai_services(request)
 
 
 def _container(deployment: client.V1Deployment, name: str) -> client.V1Container:

@@ -31,7 +31,7 @@ from utilities.trustyai import (
 
 LOGGER = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.workload]
+pytestmark = [pytest.mark.workload, pytest.mark.usefixtures("trustyai_module")]
 
 
 def _workload_operator_image(apps_client: client.AppsV1Api, namespace: str) -> str:

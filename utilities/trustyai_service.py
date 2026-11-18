@@ -16,7 +16,11 @@ import json
 import logging
 import os
 import random
+import shutil
+import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +31,8 @@ from kubernetes import client
 from kubernetes.client.exceptions import ApiException
 
 from utilities.certs import generate_serving_cert, service_dns_names
+from utilities.kube import mint_token, wait_for_deployment_available
+from utilities.portforward import allocate_local_ports, port_forward, release_local_ports
 
 LOGGER = logging.getLogger(__name__)
 
@@ -193,6 +199,76 @@ def wait_for_operand(
             if time.monotonic() >= deadline:
                 pytest.fail(f"the operator did not create {namespace}/{name} within {timeout}s", pytrace=False)
             time.sleep(interval)
+
+
+@contextmanager
+def service_environment(
+    core_client: client.CoreV1Api,
+    apps_client: client.AppsV1Api,
+    rbac_client: client.RbacAuthorizationV1Api,
+    custom_api: client.CustomObjectsApi,
+    kube_context: str,
+    namespace: str,
+    name: str = SERVICE_NAME,
+) -> Iterator[ServiceAddress]:
+    """Create a `TrustyAIService` in `namespace`, wait for its operand, and point at its API.
+
+    The whole lifecycle of one workload: the two things the platform would provide
+    are seeded first (the serving certificates the proxies mount, which OpenShift's
+    service CA issues from the serving-cert annotations, and the identity the proxy
+    authorizes), then the resource is created - only after the certificates exist,
+    because the operand cannot start without them - the operand is waited for, and
+    local ports are forwarded to its API.
+
+    It is a context manager rather than a fixture so a check can create as many
+    workloads as it needs, each in its own namespace: `tests/conftest.py` wraps it in
+    a factory, and the namespace and the forwards go away with the test.
+    """
+    ca_dir = Path(tempfile.mkdtemp(prefix="trustyai-service-ca-"))
+    api_port = health_port = 0
+    try:
+        ca_file = ca_dir / "ca.crt"
+        ca_file.write_bytes(ensure_serving_secret(core_client, namespace, f"{name}{TLS_SECRET_SUFFIX}", name))
+        # The operator mounts a second certificate into the internal proxy; nothing
+        # on Kind issues that one either.
+        ensure_serving_secret(core_client, namespace, f"{name}{INTERNAL_SECRET_SUFFIX}", name)
+        ensure_identity(core_client, rbac_client, namespace, name)
+        token = mint_token(kube_context, namespace, IDENTITY_NAME)
+
+        create_service(custom_api, namespace, name)
+        wait_for_operand(apps_client, namespace, name)
+        wait_for_deployment_available(apps_client, name, namespace, core_client=core_client)
+
+        api_port, health_port = allocate_local_ports(forwarded_api_port(), forwarded_health_port())
+        with ExitStack() as stack:
+            api_url = stack.enter_context(
+                port_forward(
+                    kube_context,
+                    namespace,
+                    f"service/{name}{TLS_SERVICE_SUFFIX}",
+                    api_port,
+                    TLS_SERVICE_PORT,
+                    scheme="https",
+                )
+            )
+            health_url = stack.enter_context(
+                port_forward(kube_context, namespace, f"service/{name}", health_port, HEALTH_SERVICE_PORT)
+            )
+            # A forward to 127.0.0.1 does not match a Service name, so the checks go
+            # through `localhost`, which the seeded certificate covers.
+            address = ServiceAddress(
+                namespace=namespace,
+                name=name,
+                token=token,
+                ca_file=ca_file,
+                api_url=api_url.replace("127.0.0.1", "localhost"),
+                health_url=health_url,
+            )
+            LOGGER.info("TrustyAI service API: %s (verify with %s)", address.api_url, ca_file)
+            yield address
+    finally:
+        release_local_ports(api_port, health_port)
+        shutil.rmtree(ca_dir, ignore_errors=True)
 
 
 def read_service(

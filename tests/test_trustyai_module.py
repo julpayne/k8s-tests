@@ -3,6 +3,10 @@
 The module CRD, both operator Deployments, the singleton TrustyAI resource and
 the module operator image, all read through the Kubernetes Python client.
 
+There is no manifest for the module resource: `make deploy` applies it through
+`utilities.stack`, and the `trustyai_module` fixture creates it when a cluster has
+none, then waits for the workload operator the module operator deploys.
+
 The module operator is deployed here on its own, without a platform operator, so
 the check for the ConfigMaps a platform operator writes (`odh-trustyai-config`
 and `trustyai-dsc-config`) has no subject on this harness and is not made.
@@ -35,7 +39,7 @@ LOGGER = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.module,
-    pytest.mark.usefixtures("modular_trustyai_architecture"),
+    pytest.mark.usefixtures("modular_trustyai_architecture", "trustyai_module"),
 ]
 
 

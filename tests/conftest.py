@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -55,24 +52,23 @@ from utilities.model import (
     model_name,
 )
 from utilities.portforward import port_forward
-from utilities.trustyai import MODULE_CRD_NAME, MODULE_OPERATOR_DEPLOYMENT, crd_exists, deployment_exists
-from utilities.trustyai_service import (
-    HEALTH_SERVICE,
-    HEALTH_SERVICE_PORT,
-    IDENTITY_NAME,
-    INTERNAL_SECRET_SUFFIX,
-    SERVICE_NAME,
-    TLS_SECRET_SUFFIX,
-    TLS_SERVICE_PORT,
-    TLS_SERVICE_SUFFIX,
-    ServiceAddress,
-    create_service,
-    ensure_identity,
-    ensure_serving_secret,
-    forwarded_api_port,
-    forwarded_health_port,
-    wait_for_operand,
+from utilities.trustyai import (
+    MODULE_CR_NAME,
+    MODULE_CRD_NAME,
+    MODULE_KIND,
+    MODULE_OPERATOR_DEPLOYMENT,
+    WORKLOAD_OPERATOR_DEPLOYMENT,
+    crd_exists,
+    delete_module,
+    deployment_exists,
+    ensure_module,
+    module_api_version,
+    point_conversion_webhooks_at_ca,
+    wait_for_rendered_workload,
+    wait_for_workload_operator,
+    webhook_ca_bundle,
 )
+from utilities.trustyai_service import SERVICE_NAME, ServiceAddress, service_environment
 
 LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +98,72 @@ def modular_trustyai_architecture(api_client: client.ApiClient, apps_client: cli
         pytest.skip(
             f"deployment {namespace}/{MODULE_OPERATOR_DEPLOYMENT} is not present; modular architecture is not enabled"
         )
+
+
+@pytest.fixture(scope="session")
+def trustyai_module(
+    api_client: client.ApiClient,
+    core_client: client.CoreV1Api,
+    apps_client: client.AppsV1Api,
+    dynamic_client: DynamicClient,
+    namespace: str,
+) -> Iterator[dict[str, Any] | None]:
+    """Ensure the module resource the module operator reconciles is there, and wait for the stack under it.
+
+    The harness ships no manifest for it: `make deploy` applies the resource through
+    `utilities.stack`, and a cluster brought up another way gets it created here,
+    the way a user would, and removed again unless the run keeps its resources. A
+    resource that is already there - the one `make deploy` created, a
+    platform-managed install, or a Kind cluster a KEEP_RESOURCES run left populated -
+    is never rewritten and never deleted by this session.
+
+    Creating the resource is only the first step: the workload operator it makes
+    the module operator deploy has to exist, and it has to be running and resolving
+    the images this run asked for before a check creates an operand, and the
+    conversion webhooks the checks go through have to trust the certificate Kind
+    cannot issue.
+
+    A cluster without the module operator has nothing to reconcile the resource and
+    already runs whatever stack the platform deployed, so the fixture leaves it
+    alone and yields None: the checks that need the module resource skip on their
+    own, and the ones that only need the workload operator still run.
+    """
+    if not crd_exists(api_client, MODULE_CRD_NAME) or not deployment_exists(
+        apps_client, MODULE_OPERATOR_DEPLOYMENT, namespace
+    ):
+        LOGGER.info(
+            "no module operator (%s/%s with CRD %s); leaving the stack as the platform runs it",
+            namespace,
+            MODULE_OPERATOR_DEPLOYMENT,
+            MODULE_CRD_NAME,
+        )
+        yield None
+        return
+    api_version = module_api_version(api_client)
+    module, created = ensure_module(dynamic_client, api_version)
+    if not created:
+        LOGGER.info(
+            "%s/%s was already on the cluster; leaving its spec alone and not deleting it afterwards",
+            MODULE_KIND,
+            MODULE_CR_NAME,
+        )
+    wait_for_workload_operator(apps_client, namespace)
+    wait_for_rendered_workload(apps_client, namespace)
+    wait_for_deployment_available(apps_client, WORKLOAD_OPERATOR_DEPLOYMENT, namespace, core_client=core_client)
+    point_conversion_webhooks_at_ca(api_client, webhook_ca_bundle(core_client, namespace))
+    try:
+        yield module
+    finally:
+        if created:
+            if keep_resources():
+                LOGGER.warning(
+                    "KEEP_RESOURCES is set: leaving %s/%s on the cluster, and the workload operator and operands "
+                    "below it",
+                    MODULE_KIND,
+                    MODULE_CR_NAME,
+                )
+            else:
+                delete_module(dynamic_client, api_version)
 
 
 @pytest.fixture(scope="session")
@@ -145,11 +207,14 @@ def evalhub_instance(
     dynamic_client: DynamicClient,
     api_client: client.ApiClient,
     evalhub_instance_namespace: str,
+    trustyai_module: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Create an EvalHub instance from Python and wait until it serves.
 
     The tests own the instance, its namespace and, because Kind has no service
-    CA, its TLS material; the operator owns everything below that.
+    CA, its TLS material; the operator owns everything below that - which is why
+    the instance is only created once the workload operator is up, behind
+    `trustyai_module`.
     """
     seed_instance_tls(core_client, EVALHUB_NAME, evalhub_instance_namespace)
     api_version = evalhub_api_version(api_client)
@@ -357,87 +422,94 @@ def evalhub_model_credentials(
 
 
 @pytest.fixture(scope="session")
-def trustyai_service_namespace(core_client: client.CoreV1Api) -> Iterator[str]:
-    """Namespace holding the TrustyAIService the checks create, removed afterwards."""
-    name = f"trustyai-service-{uuid.uuid4().hex[:6]}"
-    create_namespace(core_client, name)
-    try:
-        yield name
-    finally:
-        release_namespace(core_client, name)
+def workload_namespaces(core_client: client.CoreV1Api) -> Iterator[Callable[..., str]]:
+    """Create namespaces for workloads a check brings itself, removed when the check ends.
+
+    The operators are the session's; a workload is the check's. Anything a check
+    needs its own copy of - a `TrustyAIService`, an `LMEvalJob`, a guardrails server -
+    gets a namespace of its own from here, and the namespace takes the workload with
+    it when the check finishes, the way `opendatahub-tests` does it.
+    """
+
+    def create(request: pytest.FixtureRequest, prefix: str = "trustyai-workload") -> str:
+        name = f"{prefix}-{uuid.uuid4().hex[:6]}"
+        create_namespace(core_client, name)
+        request.addfinalizer(lambda: release_namespace(core_client, name))
+        LOGGER.info("created workload namespace %s", name)
+        return name
+
+    yield create
+
+
+@pytest.fixture(scope="session")
+def trustyai_services(
+    core_client: client.CoreV1Api,
+    apps_client: client.AppsV1Api,
+    rbac_client: client.RbacAuthorizationV1Api,
+    custom_api: client.CustomObjectsApi,
+    kube_context: str,
+    workload_namespaces: Callable[..., str],
+    trustyai_module: dict[str, Any] | None,
+) -> Iterator[Callable[..., ServiceAddress]]:
+    """Create a `TrustyAIService` workload and point the checks at its API.
+
+    `trustyai_services(request)` gives it a namespace of its own;
+    `trustyai_services(request, namespace=ns)` uses one the check already has, which
+    is how two services can share a namespace. Either way the service, its operand
+    and its port-forwards go away when the check ends.
+
+    It comes after `trustyai_module` for the same reason the other operand fixtures
+    do: there is no point creating a resource before the workload operator that
+    reconciles it is up.
+    """
+
+    def create(
+        request: pytest.FixtureRequest,
+        namespace: str | None = None,
+        name: str = SERVICE_NAME,
+    ) -> ServiceAddress:
+        if namespace is None:
+            namespace = workload_namespaces(request, prefix="trustyai-service")
+        stack = ExitStack()
+        request.addfinalizer(stack.close)
+        return stack.enter_context(
+            service_environment(
+                core_client=core_client,
+                apps_client=apps_client,
+                rbac_client=rbac_client,
+                custom_api=custom_api,
+                kube_context=kube_context,
+                namespace=namespace,
+                name=name,
+            )
+        )
+
+    yield create
+
+
+@pytest.fixture(scope="session")
+def evalhub_tenants(
+    core_client: client.CoreV1Api,
+    evalhub_instance: dict[str, Any],
+) -> Iterator[Callable[..., str]]:
+    """Label a namespace as an EvalHub tenant, removed when the check ends.
+
+    An instance reconciles every tenant-labelled namespace, so a check that needs its
+    own evaluation target asks for its own tenant namespace rather than its own
+    instance.
+    """
+
+    def create(request: pytest.FixtureRequest, prefix: str = "trustyai-evalhub-tenant") -> str:
+        name = f"{prefix}-{uuid.uuid4().hex[:6]}"
+        create_namespace(core_client, name, labels={EVALHUB_TENANT_LABEL_KEY: EVALHUB_TENANT_LABEL_VALUE})
+        request.addfinalizer(lambda: release_namespace(core_client, name))
+        LOGGER.info("created tenant namespace %s", name)
+        return name
+
+    yield create
 
 
 @pytest.fixture(scope="session")
 def trustyai_service_image() -> str:
     """The operand image the workload operator was told to deploy, if the run named one."""
     return os.environ.get(SERVICE_IMG_VAR, "")
-
-
-@pytest.fixture(scope="session")
-def trustyai_service(
-    core_client: client.CoreV1Api,
-    apps_client: client.AppsV1Api,
-    rbac_client: client.RbacAuthorizationV1Api,
-    custom_api: client.CustomObjectsApi,
-    kube_context: str,
-    trustyai_service_namespace: str,
-) -> Iterator[ServiceAddress]:
-    """Create a TrustyAIService, wait for its operand, and point the checks at its API.
-
-    Two things the platform would provide are seeded first: the serving
-    certificates the proxy mounts (OpenShift's service CA issues them from the
-    serving-cert annotations, which Kind has nothing to act on) and the identity
-    the proxy authorizes. The resource is created only after the certificates
-    exist, because the operand cannot start without them.
-    """
-    namespace = trustyai_service_namespace
-    ca_dir = Path(tempfile.mkdtemp(prefix="trustyai-service-ca-"))
-    ca_file = ca_dir / "ca.crt"
-    ca_file.write_bytes(
-        ensure_serving_secret(core_client, namespace, f"{SERVICE_NAME}{TLS_SECRET_SUFFIX}", SERVICE_NAME)
-    )
-    # The operator mounts a second certificate into the internal proxy; nothing on
-    # Kind issues it either.
-    ensure_serving_secret(core_client, namespace, f"{SERVICE_NAME}{INTERNAL_SECRET_SUFFIX}", SERVICE_NAME)
-    ensure_identity(core_client, rbac_client, namespace, SERVICE_NAME)
-    token = mint_token(kube_context, namespace, IDENTITY_NAME)
-
-    create_service(custom_api, namespace, SERVICE_NAME)
-    wait_for_operand(apps_client, namespace)
-    wait_for_deployment_available(apps_client, SERVICE_NAME, namespace, core_client=core_client)
-
-    with ExitStack() as stack:
-        api_url = stack.enter_context(
-            port_forward(
-                kube_context,
-                namespace,
-                f"service/{SERVICE_NAME}{TLS_SERVICE_SUFFIX}",
-                forwarded_api_port(),
-                TLS_SERVICE_PORT,
-                scheme="https",
-            )
-        )
-        health_url = stack.enter_context(
-            port_forward(
-                kube_context,
-                namespace,
-                f"service/{HEALTH_SERVICE}",
-                forwarded_health_port(),
-                HEALTH_SERVICE_PORT,
-            )
-        )
-        # A forward to 127.0.0.1 does not match a Service name, so the checks go
-        # through `localhost`, which the seeded certificate covers.
-        address = ServiceAddress(
-            namespace=namespace,
-            name=SERVICE_NAME,
-            token=token,
-            ca_file=ca_file,
-            api_url=api_url.replace("127.0.0.1", "localhost"),
-            health_url=health_url,
-        )
-        LOGGER.info("TrustyAI service API: %s (verify with %s)", address.api_url, ca_file)
-        try:
-            yield address
-        finally:
-            shutil.rmtree(ca_dir, ignore_errors=True)

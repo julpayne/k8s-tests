@@ -37,8 +37,6 @@ MODULE_IMG ?= $(IMAGE_PREFIX)/trustyai-operator-module:$(TAG)
 # Leave empty to use docker when available, otherwise podman.
 ENGINE ?=
 
-TRUSTYAI_CR_FILE ?= hack/manifests/trustyai-cr.yaml
-
 # The LLM emulator the checks call as their model is deployed and removed by the
 # pytest fixtures (see utilities/emulator.py), not by this harness. These are the
 # settings those fixtures read; leave them empty to use their defaults.
@@ -83,7 +81,7 @@ ADAPTERS_MARKER ?= adapters
 ADAPTERS_REPORT_FILE ?= reports/adapters.html
 
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
-	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG TRUSTYAI_SERVICE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT \
+	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG TRUSTYAI_SERVICE_IMG ENGINE TIMEOUT \
 	REPORT_FILE ADAPTERS_MARKER ADAPTERS_REPORT_FILE EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN \
 	MODEL_URL MODEL_KEY MODEL_NAME KEEP_RESOURCES
 
@@ -123,11 +121,11 @@ load: ## Load the built images into the Kind cluster.
 	hack/load-images.sh
 
 .PHONY: deploy
-deploy: check-operator-repo ## Deploy the module operator, overriding the image values with the built ones.
+deploy: check-operator-repo ## Deploy the module operator, create its module resource, and wait for the workload operator.
 	hack/deploy.sh
 
 .PHONY: up
-up: check-operator-repo cluster images load deploy ## Create the cluster, build, load and deploy.
+up: check-operator-repo cluster images load deploy ## Create the cluster, build, load, deploy, and wait for both operators.
 
 .PHONY: down
 down: cluster-delete ## Delete the Kind cluster.

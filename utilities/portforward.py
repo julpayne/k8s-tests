@@ -21,6 +21,12 @@ LOGGER = logging.getLogger(__name__)
 
 PORT_FORWARD_TIMEOUT = 30.0
 
+# Local ports this session has reserved for forwards. A run can hold several
+# forwarded Services at once - a test may create its own workload in its own
+# namespace - and two forwards cannot share a local port.
+_ALLOCATED_PORTS: set[int] = set()
+_PORT_SEARCH_LIMIT = 200
+
 
 def kubectl_binary() -> str:
     """The kubectl to shell out to, skipped when it is not installed."""
@@ -28,6 +34,46 @@ def kubectl_binary() -> str:
     if shutil.which(kubectl) is None:
         pytest.skip(f"{kubectl} is not installed, so the Service cannot be reached")
     return kubectl
+
+
+def _port_is_free(port: int) -> bool:
+    """Whether nothing is bound to the port on the loopback interface."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def allocate_local_ports(*bases: int) -> tuple[int, ...]:
+    """Reserve free local ports for the forwards, starting at the requested bases.
+
+    The first caller gets the ports the environment names, so a run with one
+    forwarded Service keeps the documented pair; a second Service - a check that
+    created its own workload - gets the next free pair. A port already reserved for
+    this session, or bound by something else on the host, is skipped.
+    """
+    for offset in range(_PORT_SEARCH_LIMIT):
+        candidate = tuple(base + offset for base in bases)
+        if any(port in _ALLOCATED_PORTS for port in candidate):
+            continue
+        if not all(_port_is_free(port) for port in candidate):
+            continue
+        _ALLOCATED_PORTS.update(candidate)
+        LOGGER.info("reserved local ports %s for port-forwards", candidate)
+        return candidate
+    pytest.fail(
+        f"no free local ports near {bases} after {_PORT_SEARCH_LIMIT} attempts; "
+        "set TRUSTYAI_SERVICE_API_PORT and TRUSTYAI_SERVICE_HEALTH_PORT to other bases",
+        pytrace=False,
+    )
+
+
+def release_local_ports(*ports: int) -> None:
+    """Give a reservation back, so a later Service can reuse the ports."""
+    _ALLOCATED_PORTS.difference_update(ports)
 
 
 def _wait_for_local_port(port: int, process: subprocess.Popen[str], timeout: float) -> None:
