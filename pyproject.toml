@@ -23,6 +23,7 @@ markers = [
     "evalhub: checks for the EvalHub instance the workload operator deploys",
     "emulator: checks for the LLM emulator and the token it requires",
     "benchmark: checks that submit an evaluation job and read its results",
+    "adapters: EvalHub adapters: one real benchmark per job, run as a section of their own",
     "module: checks for the TrustyAI module operator and the TrustyAI resource it reconciles",
     "workload: checks for the TrustyAI workload (service) operator",
     "service: checks for the TrustyAIService resource, its operand and the API behind it",

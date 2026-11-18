@@ -65,9 +65,16 @@ TIMEOUT ?= 300s
 PYTEST_ARGS ?=
 REPORT_FILE ?= reports/report.html
 
+# The EvalHub adapter checks are a section of their own: each one submits a real
+# benchmark, which fetches its dataset from the Hub and takes minutes, so
+# `make test` leaves the marker out and `make test-evalhub-adapters` runs nothing
+# else.
+ADAPTERS_MARKER ?= adapters
+ADAPTERS_REPORT_FILE ?= reports/adapters.html
+
 export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
 	WORKLOAD_IMG MODULE_IMG EVALHUB_IMG TRUSTYAI_SERVICE_IMG ENGINE TRUSTYAI_CR_FILE TIMEOUT \
-	REPORT_FILE EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN KEEP_RESOURCES
+	REPORT_FILE ADAPTERS_MARKER ADAPTERS_REPORT_FILE EMULATOR_IMG EMULATOR_NAMESPACE EMULATOR_TOKEN KEEP_RESOURCES
 
 .PHONY: help
 help: ## Display this help.
@@ -119,7 +126,19 @@ clean: ## Delete the built operator images and the HTML report (leaves the clust
 	hack/clean.sh
 
 .PHONY: test
-test: ## Run the pytest suite and write an HTML report.
+test: ## Run every section except the EvalHub adapters, and write an HTML report.
+	@uv run pytest -m 'not $(ADAPTERS_MARKER)' $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(REPORT_FILE))"; \
+		exit $${status:-0}
+
+.PHONY: test-evalhub-adapters
+test-evalhub-adapters: ## Run only the EvalHub adapter checks, and write their own HTML report.
+	@uv run pytest -m '$(ADAPTERS_MARKER)' $(PYTEST_ARGS) --html=$(ADAPTERS_REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(ADAPTERS_REPORT_FILE))"; \
+		exit $${status:-0}
+
+.PHONY: test-all
+test-all: ## Run every section, the EvalHub adapters included.
 	@uv run pytest $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
 		echo "HTML report: $(abspath $(REPORT_FILE))"; \
 		exit $${status:-0}
