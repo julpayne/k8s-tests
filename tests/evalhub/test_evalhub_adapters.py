@@ -6,13 +6,12 @@ when `MODEL_URL` is set, a real endpoint, waits for the adapter to finish in the
 cluster, and reads the result back. `BENCHMARKS` is what the section covers; a new
 benchmark is one entry there, and every check below then runs once for it.
 
-The section carries the `adapters` marker and nothing else, so it is selected on
-its own (`make test-evalhub-adapters`, or `-m adapters`) and left out of the
-platform run (`make test`, which excludes the marker), in both directions: the
-EvalHub instance checks in `test_evalhub.py` never pull these in, and neither
-marker selects the other. They are separate because an adapter run costs minutes
-and fetches its benchmark's dataset from the Hub, neither of which belongs in a
-smoke run.
+The section carries the `evalhub` and `adapters` markers: `evalhub` puts it in the
+EvalHub selection, `adapters` names the section within it. An adapter run costs
+minutes per benchmark - the adapter image is pulled and the dataset fetched from
+the Hub - so it is never part of a default run: `make test` excludes the
+`adapters` marker, `make test-evalhub` is `evalhub and not adapters`, and
+`make test-evalhub-adapters` runs this section alone, into its own report.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from utilities.model import ModelEndpoint
 
 LOGGER = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.adapters]
+pytestmark = [pytest.mark.evalhub, pytest.mark.adapters]
 
 LM_EVAL_PROVIDER = "lm_evaluation_harness"
 # One example: enough for the harness to score, small enough for a Kind cluster.

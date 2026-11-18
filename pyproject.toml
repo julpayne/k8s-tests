@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cryptography>=43",
     "kubernetes>=31.0.0",
+    "pyyaml>=6",
     "pytest>=8.0",
     "requests>=2.32",
 ]
@@ -21,6 +22,7 @@ dev = [
 testpaths = ["tests"]
 markers = [
     "evalhub: checks for the EvalHub instance the workload operator deploys",
+    "generation: checks for the collection generation API and the authorization the proxy applies to it",
     "emulator: checks for the LLM emulator and the token it requires",
     "benchmark: checks that submit an evaluation job and read its results",
     "adapters: EvalHub adapters: one real benchmark per job, run as a section of their own",

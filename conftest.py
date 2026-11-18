@@ -171,14 +171,19 @@ def report_target(clients: tuple[client.CoreV1Api, client.AppsV1Api], kube_conte
 
 # --- report grouping -------------------------------------------------------
 #
-# Every test carries an `evalhub`, `adapters`, `emulator`, `module`, `service` or `workload` marker. The run is
-# ordered by them so the HTML report reads as one block per component, with a
-# Scope column naming the block its first row starts.
+# Selection has two axes: the directory names the component (`tests/evalhub`), the
+# marker names the section within it (`generation`, `benchmark`, `adapters`). A
+# module therefore carries its component's marker plus its section's, so it is
+# selected as part of the component and can still be run on its own.
+#
+# The report groups by the first marker in this list, so a section that has to stay
+# a block of its own (`adapters`) comes before the component it belongs to. The run
+# is ordered the same way, and the Scope column names the block a row starts.
 
-SCOPE_MARKERS = ("evalhub", "adapters", "emulator", "module", "service", "workload")
+SCOPE_MARKERS = ("adapters", "evalhub", "emulator", "module", "service", "workload")
 SCOPE_TITLES = {
-    "evalhub": "EvalHub",
     "adapters": "EvalHub adapters",
+    "evalhub": "EvalHub",
     "emulator": "LLM emulator",
     "module": "Module operator",
     "service": "TrustyAI service",

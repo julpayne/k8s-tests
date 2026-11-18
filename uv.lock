@@ -698,6 +698,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "kubernetes" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "requests" },
 ]
 
@@ -712,6 +713,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=43" },
     { name = "kubernetes", specifier = ">=31.0.0" },
     { name = "pytest", specifier = ">=8.0" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "requests", specifier = ">=2.32" },
 ]
 

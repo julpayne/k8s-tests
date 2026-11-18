@@ -87,7 +87,7 @@ export KIND KUBECTL KIND_CLUSTER KUBE_CONTEXT NAMESPACE OPERATOR_REPO TAG \
 
 .PHONY: help
 help: ## Display this help.
-	@awk 'BEGIN {FS = ":.*## "}; /^[a-zA-Z_0-9-]+:.*## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_0-9-]+:.*## / {names[++n] = $$1; desc[n] = $$2; if (length($$1) > width) width = length($$1)} END {for (i = 1; i <= n; i++) printf "  \033[36m%-*s\033[0m %s\n", width, names[i], desc[i]}' $(MAKEFILE_LIST)
 
 .PHONY: cluster
 cluster: ## Create the Kind cluster (idempotent).
@@ -144,6 +144,39 @@ test: ## Run every section except the EvalHub adapters, and write an HTML report
 test-evalhub-adapters: ## Run only the EvalHub adapter checks, and write their own HTML report.
 	@uv run pytest -m '$(ADAPTERS_MARKER)' $(PYTEST_ARGS) --html=$(ADAPTERS_REPORT_FILE) --self-contained-html || status=$$?; \
 		echo "HTML report: $(abspath $(ADAPTERS_REPORT_FILE))"; \
+		exit $${status:-0}
+
+# Selection has two axes: a directory names a component (tests/evalhub), a marker
+# names a section within it (evalhub, benchmark, adapters, generation, ...).
+# The targets below name the common combinations; test-select takes any pytest
+# selection, so a section, a directory, a node id or -k all work:
+#
+#   make test-select SELECT='-m generation'
+#   make test-select SELECT='-m "evalhub and not adapters"'
+#   make test-select SELECT=tests/evalhub
+#   make test-select SELECT=tests/evalhub/test_evalhub.py::test_evalhub_health_endpoint
+#   make test-select SELECT='-k tenant_role'
+
+.PHONY: test-evalhub
+test-evalhub: ## Run every EvalHub check except the adapter section.
+	@uv run pytest -m 'evalhub and not $(ADAPTERS_MARKER)' $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(REPORT_FILE))"; \
+		exit $${status:-0}
+
+.PHONY: test-evalhub-generation
+test-evalhub-generation: ## Run only the collection generation authorization checks.
+	@uv run pytest -m 'evalhub and generation' $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(REPORT_FILE))"; \
+		exit $${status:-0}
+
+.PHONY: test-select
+test-select: ## Run one selection, e.g. SELECT='-m generation' or SELECT=tests/evalhub.
+	@test -n '$(strip $(SELECT))' || { \
+		echo "error: SELECT is required, e.g. make test-select SELECT='-m generation' or SELECT=tests/evalhub" >&2; \
+		exit 2; \
+	}
+	@uv run pytest $(SELECT) $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(REPORT_FILE))"; \
 		exit $${status:-0}
 
 .PHONY: test-all
