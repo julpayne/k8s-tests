@@ -169,6 +169,12 @@ test-evalhub-generation: ## Run only the collection generation authorization che
 		echo "HTML report: $(abspath $(REPORT_FILE))"; \
 		exit $${status:-0}
 
+.PHONY: test-lmeval
+test-lmeval: ## Run the LMEvalJob checks, the Pod and the NetworkPolicy that guards it.
+	@uv run pytest -m 'lmeval' $(PYTEST_ARGS) --html=$(REPORT_FILE) --self-contained-html || status=$$?; \
+		echo "HTML report: $(abspath $(REPORT_FILE))"; \
+		exit $${status:-0}
+
 .PHONY: test-select
 test-select: ## Run one selection, e.g. SELECT='-m generation' or SELECT=tests/evalhub.
 	@test -n '$(strip $(SELECT))' || { \

@@ -134,6 +134,12 @@ def rbac_client(api_client: client.ApiClient) -> client.RbacAuthorizationV1Api:
 
 
 @pytest.fixture(scope="session")
+def networking_client(api_client: client.ApiClient) -> client.NetworkingV1Api:
+    """Client for the NetworkPolicies the workload operator creates for a workload."""
+    return client.NetworkingV1Api(api_client)
+
+
+@pytest.fixture(scope="session")
 def dynamic_client(api_client: client.ApiClient) -> DynamicClient:
     """Dynamic client for custom resources the typed clients do not model."""
     return DynamicClient(api_client)
@@ -180,11 +186,12 @@ def report_target(clients: tuple[client.CoreV1Api, client.AppsV1Api], kube_conte
 # a block of its own (`adapters`) comes before the component it belongs to. The run
 # is ordered the same way, and the Scope column names the block a row starts.
 
-SCOPE_MARKERS = ("adapters", "evalhub", "emulator", "module", "service", "workload")
+SCOPE_MARKERS = ("adapters", "evalhub", "emulator", "lmeval", "module", "service", "workload")
 SCOPE_TITLES = {
     "adapters": "EvalHub adapters",
     "evalhub": "EvalHub",
     "emulator": "LLM emulator",
+    "lmeval": "LMEvalJob",
     "module": "Module operator",
     "service": "TrustyAI service",
     "workload": "Workload operator",

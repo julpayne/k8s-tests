@@ -188,7 +188,7 @@ a marker of your own belongs in `pyproject.toml` next to the others.
 | `IMAGE_PREFIX` | `localhost` | Registry/repository prefix used by both image references |
 | `ENGINE` | auto | `podman` or `docker`; detected when unset |
 | `TIMEOUT` | `300s` | Timeout for each readiness wait |
-| `PYTEST_ARGS` | *(empty)* | Extra pytest arguments, e.g. `-m module`, `-m adapters` or `-k evalhub` |
+| `PYTEST_ARGS` | *(empty)* | Extra pytest arguments, e.g. `-m module`, `-m lmeval`, `-m adapters` or `-k evalhub` |
 | `REPORT_FILE` | `reports/report.html` | Report written by `make test` and `make test-all` |
 | `ADAPTERS_REPORT_FILE` | `reports/adapters.html` | Report written by `make test-evalhub-adapters` |
 | `KEEP_RESOURCES` | *(empty)* | Leave everything the run created on the cluster: see [Keeping the resources](#keeping-the-resources) |
@@ -403,6 +403,40 @@ make test-select SELECT='-m generation'       # the same, spelled as a selection
 make test-select SELECT='-k tenant_role'      # or one check of it, by name
 ```
 
+## LMEvalJob
+
+`tests/lmeval/test_lmeval_network_policy.py` creates an `LMEvalJob` itself and checks what
+the workload operator builds around it: a Pod running lm-evaluation-harness, and a
+NetworkPolicy whose selector is that Pod's identity labels
+(`trustyai.opendatahub.io/component: lmes`, `role: evaluation`, `owner-uid: <job
+uid>`, plus the `lmevaljob-uid` label the first, ingress-only policy selected on).
+The policy admits no ingress and one allow-all egress rule, which is the operator's
+documented intent: an evaluation reaches arbitrary model endpoints, tokenizer and
+dataset downloads, S3 and OCI, so an allowlist is not something it can derive.
+
+The section carries the `lmeval` marker, and `tests/lmeval/` holds it the way
+`tests/evalhub/` holds the EvalHub sections: a directory per component, a marker per
+section within it. The `lmes` names above are the operator's own - its `lmes` service
+and the `component: lmes` label value - not the marker.
+
+The contract under test is convergence, not the evaluation. On every reconcile the
+operator re-derives the policy and the Pod's identity, so deleting the policy,
+clearing its rules, or taking an identity label off the Pod has to be repaired - a
+running evaluation that loses its selector is one nothing reports. A *completed* job
+is the hard case and the one that regresses first: there is no polling interval left
+to fall back on, so the repair has to come from watching the Pod.
+
+The Pod is deliberately held out of the scheduler by a CPU request no Kind node can
+satisfy, so nothing is pulled or run: the convergence happens before the first
+container starts, and a real benchmark would need a model and a dataset to prove the
+same thing. The completed-job case is reproduced the way the operator's own suite
+does it, by writing the status a finished run reports, because that is the input the
+repair path reacts to.
+
+```sh
+make test-lmeval    # only this section
+```
+
 ## TrustyAI service
 
 `tests/test_trustyai_service.py` creates a `TrustyAIService` itself, waits for
@@ -449,6 +483,7 @@ operators.
 | `tests/evalhub/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator or `MODEL_URL`, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and - against the emulator - the emulator saw the tenant Secret's token (or `MODEL_KEY`) on a `/v1` request |
 | `tests/evalhub/test_evalhub_adapters.py` | the EvalHub adapters section (opt-in, `make test-evalhub-adapters`): each benchmark in its table - currently `ethics_cm` of `lm_evaluation_harness`, with `num_examples: 1` against the emulator or `MODEL_URL` - is accepted as the job's only benchmark, reaches `completed`, reports the benchmark, provider, numeric metrics and the `acc` its provider scores it on, turns its pass criteria into a test outcome, and - against the emulator - the emulator authenticated the model requests it made |
 | `tests/evalhub/test_evalhub_collection_generation.py` | the authorization `trustyai-service-operator#1131` added for the collection generation API: the mounted policy maps `POST /api/v1/evaluations/collections/generation` to `evaluations create` and `GET`/`DELETE .../generation/{id}` to `evaluations` `{{.FromMethod}}`, each declared once with the `X-Tenant` rewrite and ahead of the generic `/api/v1/evaluations/collections/*` entry that also maps `get` and `delete`; the removed `.../generation/models` path has no mapping; the pod template's `auth.yaml` digest describes the policy the container mounts; the tenant-user Role grants `evaluations` `get`/`create`/`delete` and no collection write; and, as an identity granted exactly those rules, all three paths answer through the proxy (not `401`/`403`), need a token, and are refused when `X-Tenant` names a namespace the identity has no grant in |
+| `tests/lmeval/test_lmeval_network_policy.py` | an `LMEvalJob`: the operator creates one NetworkPolicy, owned by the job, admitting no ingress and one allow-all egress rule, selecting the Pod on the identity labels it also stamps there; taking any of the four identity labels off the Pod is repaired (also for a completed job, where only the Pod watch is left to trigger it); editing the policy's rules is repaired while an annotation the operator does not own is kept; and deleting the policy brings a replacement with a new UID rather than reviving the old one |
 | `tests/test_trustyai_service.py` | the TrustyAI service: the CRD serves `v1` and `v1alpha1` through a conversion webhook and a resource created as one reads back as the other; the operand rolls out one replica with the `trustyai-service`, `kube-rbac-proxy` and `internal-tls-proxy` containers, runs the requested image, carries the resource's schedule and storage settings, and mounts a bound claim at the requested size; `/q/health` answers `healthy` unauthenticated; `/info` needs a token and refuses one without the grant; both halves of a drift comparison upload and are counted; CompareMeans detects the shifted distribution; and a scheduled metric is listed once and deleted |
 | `tests/evalhub/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
 
@@ -463,6 +498,7 @@ make test                                                  # everything except t
 make test-evalhub                                          # all EvalHub checks, adapters excluded
 make test-evalhub-generation                               # just the collection generation authorization
 make test-evalhub-adapters                                 # just the adapter jobs (slow, own report)
+make test-lmeval                                           # just the LMEvalJob checks
 make test-all                                              # everything, adapters included
 ```
 
@@ -472,6 +508,7 @@ directory, a node id or `-k` - whatever pytest accepts:
 ```sh
 make test-select SELECT='-m generation'                    # one section
 make test-select SELECT=tests/evalhub                      # one component directory
+make test-select SELECT=tests/lmeval                       # the same, for another component
 make test-select SELECT='-m "evalhub and not adapters"'     # a component without its slow section
 make test-select SELECT='-m "evalhub and not benchmark and not adapters"'
 make test-select SELECT=tests/evalhub/test_evalhub_collection_generation.py
@@ -480,8 +517,8 @@ make test-select SELECT='-k tenant_role'                   # one check, by name
 ```
 
 For example: `-m module` the modular stack, `-m workload` the workload operator,
-`-m service` the TrustyAI service, `-m emulator` the LLM emulator, `-m benchmark`
-the harness smoke job. The same
+`-m lmeval` an `LMEvalJob` and its NetworkPolicy, `-m service` the TrustyAI service,
+`-m emulator` the LLM emulator, `-m benchmark` the harness smoke job. The same
 selections run through `make test PYTEST_ARGS=...` when a full run with an extra
 filter is what you want; `test-select` runs only the selection.
 
@@ -560,9 +597,9 @@ Every run also writes a self-contained HTML report (git-ignored) that keeps the
 captured log and failure detail per test: `reports/report.html` for `make test`
 and `make test-all`, `reports/adapters.html` for `make test-evalhub-adapters`.
 The run is ordered by scope and the report shows it: one block each for the EvalHub
-adapters, EvalHub, the LLM emulator, the module operator, the TrustyAI service and
-the workload operator, a `Scope` column naming the block its first row starts, and
-a per-scope count above the table.
+adapters, EvalHub, the LLM emulator, an `LMEvalJob`, the module operator, the
+TrustyAI service and the workload operator, a `Scope` column naming the block its
+first row starts, and a per-scope count above the table.
 
 ```sh
 make test REPORT_FILE=/tmp/trustyai.html                     # choose the report path
@@ -586,6 +623,9 @@ Layout:
   authorization. They share the fixtures in `tests/conftest.py`, and
   `utilities/evalhub_auth.py` holds the policy and tenant-Role readers the
   authorization checks use
+- `tests/lmeval/` — the `LMEvalJob` checks: the execution Pod the workload operator
+  creates and the NetworkPolicy that selects it, repaired after drift, deletion and a
+  lost identity label. `utilities/lmeval.py` holds the job manifest and the waits
 - `utilities/` — helpers shared by the tests; `utilities/kube.py` loads the
   clients and turns Deployment and pod status into readable failures,
   `utilities/trustyai.py` builds the module resource and waits for the stack
