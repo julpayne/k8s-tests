@@ -16,9 +16,13 @@ instances are created by the tests, so the instance lifecycle is under test.
 
 ### Prerequisites
 
-- `kind`, `kubectl`, and `python3` with the [`cryptography`][cryptography]
-  package
+- `kind` and `kubectl` 1.24 or newer, which the checks need to mint bearer
+  tokens with `kubectl create token`
 - `podman` or `docker` to build the images
+- `uv`, which resolves the pinned Python 3.11+ dependencies from `uv.lock` for
+  `make test`, `make test-evalhub-adapters`, `make lint` and `make fmt`
+- `python3` with the [`cryptography`][cryptography] package, which `make deploy`
+  runs `hack/gen-certs.py` with to create the TLS secrets Kind does not issue
 - a `trustyai-service-operator` checkout, passed as `OPERATOR_REPO`
 
 [cryptography]: https://cryptography.io/
@@ -44,7 +48,8 @@ make deploy     # deploy the module operator, pointing it at the built images
 the flag when it is missing or does not look like an operator checkout.
 
 Tear the cluster down with `make down`; `make clean` also deletes the images
-the harness built and the HTML report, without touching the cluster.
+the harness built and the HTML reports (`reports/`), without touching the
+cluster.
 
 ### What `make deploy` does
 
@@ -78,6 +83,7 @@ platform operator would.
 | `KIND_NODE_IMAGE` | Kind's default | Pin a node image, e.g. `kindest/node:v1.29.0` |
 | `KIND_PROVIDER` | auto | Force `podman` or `docker` on hosts that have both |
 | `NAMESPACE` | `system` | Namespace both operators are deployed into |
+| `KUBECTL` | `kubectl` | kubectl the harness and the checks shell out to, including the token the API checks mint |
 | `MODEL_URL` | *(empty)* | OpenAI-compatible base URL the job checks call instead of the emulator; setting it stops the fixtures deploying the emulator |
 | `MODEL_KEY` | *(empty)* | Credential for `MODEL_URL`; the fixtures write it to the `model-credentials` Secret under `api-key`, which the job names in `model.auth.secret_ref` |
 | `MODEL_NAME` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Model name a job submits |
@@ -89,6 +95,13 @@ platform operator would.
 | `IMAGE_PREFIX` | `localhost` | Registry/repository prefix used by both image references |
 | `ENGINE` | auto | `podman` or `docker`; detected when unset |
 | `TIMEOUT` | `300s` | Timeout for each readiness wait |
+| `PYTEST_ARGS` | *(empty)* | Extra pytest arguments, e.g. `-m module`, `-m adapters` or `-k evalhub` |
+| `REPORT_FILE` | `reports/report.html` | Report written by `make test` and `make test-all` |
+| `ADAPTERS_REPORT_FILE` | `reports/adapters.html` | Report written by `make test-evalhub-adapters` |
+| `KEEP_RESOURCES` | *(empty)* | Leave everything the run created on the cluster: see [Keeping the resources](#keeping-the-resources) |
+
+The LLM emulator's `EMULATOR_IMG`, `EMULATOR_NAMESPACE` and `EMULATOR_TOKEN` are
+documented under [LLM emulator](#llm-emulator).
 
 ### Notes and troubleshooting
 
@@ -113,14 +126,15 @@ platform operator would.
   (`kubectl get evalhubs -A`).
 - The LLM emulator (`vllm-emulator`) is deployed by the fixtures into the
   namespace under test and removed when the run ends; a job reaches it in-cluster
-  as `vllm-emulator:8000`, which is what the benchmark check submits. While a run
-  is in flight it can be poked at from the host with
+  as `vllm-emulator:8000`, which is what the benchmark and adapter checks
+  submit. While a run is in flight it can be poked at from the host with
   `kubectl -n system port-forward svc/vllm-emulator 8000`.
 - The EvalHub tests create their own instance with the sqlite database backend,
   since Kind has no PostgreSQL, and mint its `evalhub-tls` certificate and
   `evalhub-service-ca` bundle, which OpenShift's service CA would provide. The
   EvalHub image is pulled from the registry rather than loaded into the node, so
-  the first `make test` needs network access. `make up EVALHUB_IMG=<ref>` points
+  the first `make test` needs network access; the adapter checks also fetch their
+  benchmark's dataset from the Hub. `make up EVALHUB_IMG=<ref>` points
   the instances those tests create at another image, for example one built from
   `eval-hub`.
 
@@ -185,6 +199,11 @@ EvalHub API and reads its results:
   `num_examples: 1`, against the emulator's in-cluster URL or `MODEL_URL` when
   that is set.
 
+It is the harness's own end-to-end check of the API, the sidecar and the
+credential, so it stays in `make test`. Benchmarks that are the point of the run
+rather than a check of the plumbing live in [EvalHub adapters](#evalhub-adapters),
+one per entry in its table.
+
 The job runs in the cluster: the adapter container calls the model through the
 EvalHub sidecar, which injects the credential. The checks assert the job reaches
 `completed`, that `results.benchmarks[0]` carries the benchmark id, provider and
@@ -198,6 +217,40 @@ so it can be filtered out:
 
 ```sh
 make test PYTEST_ARGS="-m 'not benchmark'"
+```
+
+## EvalHub adapters
+
+`tests/test_evalhub_adapters.py` is the section that runs real benchmarks. Every
+entry in its `BENCHMARKS` table is one adapter run: submitted through the API,
+waited for until the adapter finishes in the cluster, and read back as a result.
+It covers one today, `ethics_cm` (commonsense moral judgment) of the
+`lm_evaluation_harness` provider with `num_examples: 1`; adding a benchmark is one
+more entry in that table, and every check then runs once for it, under a
+`[<benchmark>]` id. Its jobs call the same endpoint the benchmark job does: the
+emulator the fixtures deploy, or `MODEL_URL` when that is set, with `MODEL_KEY` as
+the credential.
+
+For each benchmark the section asserts that the job is accepted with exactly that
+benchmark, its provider and its `num_examples`; that the job and the benchmark
+alone reach `completed`; that `results.benchmarks[]` carries the benchmark, its
+provider and numeric metrics; that the metric the provider config scores it on
+(`acc` for `ethics_cm`) is among those metrics and is a rate; that the provider's
+pass criteria turn the score into a `test` block; and, when the model is the
+emulator, that it authenticated the job's model requests, so the model was called
+rather than the job merely reporting success.
+
+The section carries the `adapters` marker and nothing else, in both directions:
+the EvalHub instance checks are `evalhub` and never select it, and it never
+selects them. An adapter run costs minutes and fetches its benchmark's dataset
+from the Hub, so `make test` leaves the section out and it runs on its own, with a
+report of its own:
+
+```sh
+make test-evalhub-adapters                    # only this section, into reports/adapters.html
+make test-evalhub-adapters KEEP_RESOURCES=1   # leave the job, its pod and the adapter logs behind
+make test-all                                 # every section, the adapters included
+make test PYTEST_ARGS="-m adapters"            # the same selection, into the usual report
 ```
 
 ## TrustyAI service
@@ -244,6 +297,7 @@ operators.
 | `tests/test_trustyai_workload.py` | the workload operator image: it matches the `RELATED_IMAGE_*` value the module operator renders it from, the image the harness built, and the operator's own ConfigMap |
 | `tests/test_emulator.py` | the LLM emulator (skipped when `MODEL_URL` is set): its Deployment runs the pinned image and is healthy, `/health` needs no token, `/v1/completions` and `/v1/chat/completions` answer `401` without the token or with another one and `200` with the token from the `vllm-emulator-auth` Secret, that Secret carries the `api-key` key `model.auth.secret_ref` resolves, and the token check reports which token fingerprint it saw |
 | `tests/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator or `MODEL_URL`, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and - against the emulator - the emulator saw the tenant Secret's token (or `MODEL_KEY`) on a `/v1` request |
+| `tests/test_evalhub_adapters.py` | the EvalHub adapters section (opt-in, `make test-evalhub-adapters`): each benchmark in its table - currently `ethics_cm` of `lm_evaluation_harness`, with `num_examples: 1` against the emulator or `MODEL_URL` - is accepted as the job's only benchmark, reaches `completed`, reports the benchmark, provider, numeric metrics and the `acc` its provider scores it on, turns its pass criteria into a test outcome, and - against the emulator - the emulator authenticated the model requests it made |
 | `tests/test_trustyai_service.py` | the TrustyAI service: the CRD serves `v1` and `v1alpha1` through a conversion webhook and a resource created as one reads back as the other; the operand rolls out one replica with the `trustyai-service`, `kube-rbac-proxy` and `internal-tls-proxy` containers, runs the requested image, carries the resource's schedule and storage settings, and mounts a bound claim at the requested size; `/q/health` answers `healthy` unauthenticated; `/info` needs a token and refuses one without the grant; both halves of a drift comparison upload and are counted; CompareMeans detects the shifted distribution; and a scheduled metric is listed once and deleted |
 | `tests/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
 
@@ -253,17 +307,23 @@ Select one area with the markers:
 make test PYTEST_ARGS="-m module"                          # the modular stack
 make test PYTEST_ARGS="-m workload"                        # the workload operator
 make test PYTEST_ARGS="-m evalhub"                         # the EvalHub instance
+make test PYTEST_ARGS="-m service"                         # the TrustyAI service
 make test PYTEST_ARGS="-m emulator"                        # the LLM emulator
-make test PYTEST_ARGS="-m benchmark"                       # the benchmark job
+make test PYTEST_ARGS="-m benchmark"                       # the harness smoke job
+make test-evalhub-adapters                                 # the EvalHub adapters (opt-in, own report)
 ```
+
+`make test` runs every section except the EvalHub adapters, which are opt-in: see
+[EvalHub adapters](#evalhub-adapters).
 
 Checks that need an OLM-managed or platform-managed install are deliberately
 absent, because the harness cannot provide one: the `odh-trustyai-config` and
 `trustyai-dsc-config` ConfigMaps written by a platform operator, the check that
 the image is listed in an operator CSV's `relatedImages` and released from
-`registry.redhat.io` by digest, and the EvalHub provider, collection, job, MCP,
-metrics and multi-tenancy suites, which need provider images, Kueue, MCP or the
-platform's tenant RBAC.
+`registry.redhat.io` by digest, and the EvalHub provider, collection, MCP,
+metrics and multi-tenancy suites, which need Kueue, MCP or the platform's tenant
+RBAC. Of the providers, one job is covered: [EvalHub adapters](#evalhub-adapters)
+runs `ethics_cm` of `lm_evaluation_harness` end to end, not the suite of them.
 
 The EvalHub API checks call `/api/v1/health` through a `kubectl port-forward` to
 the Service. That path is exempt from the kube-rbac-proxy authorization the
@@ -272,7 +332,9 @@ certificate, because a forwarded port is reached as 127.0.0.1 and the harness
 certificate only covers the in-cluster Service names.
 
 ```sh
-make test                                                  # default target
+make test                                                  # every section except the adapters
+make test-evalhub-adapters                                 # only the EvalHub adapters
+make test-all                                              # every section
 make test PYTEST_ARGS="-v"                                 # extra pytest flags
 KUBE_CONTEXT=my-cluster NAMESPACE=opendatahub make test     # another cluster
 ```
@@ -316,14 +378,17 @@ server version, the image each operator runs, replica and condition details, and
 the readiness of every pod, so a passing run shows what was checked and a
 failing one says what was not.
 
-Every run also writes a self-contained HTML report to `reports/report.html`
-(git-ignored) that keeps the captured log and failure detail per test. The run is
-ordered by scope and the report shows it: one block each for EvalHub, the module
-operator and the workload operator, a `Scope` column naming the block its first
-row starts, and a per-scope count above the table.
+Every run also writes a self-contained HTML report (git-ignored) that keeps the
+captured log and failure detail per test: `reports/report.html` for `make test`
+and `make test-all`, `reports/adapters.html` for `make test-evalhub-adapters`.
+The run is ordered by scope and the report shows it: one block each for EvalHub,
+the EvalHub adapters, the LLM emulator, the module operator, the TrustyAI service
+and the workload operator, a `Scope` column naming the block its first row
+starts, and a per-scope count above the table.
 
 ```sh
-make test REPORT_FILE=/tmp/trustyai.html       # choose the report path
+make test REPORT_FILE=/tmp/trustyai.html                     # choose the report path
+make test-evalhub-adapters ADAPTERS_REPORT_FILE=/tmp/a.html  # the same for the adapters
 ```
 
 Checks run against `KUBE_CONTEXT` (default `kind-trustyai`) and `NAMESPACE`
@@ -342,8 +407,10 @@ Layout:
   `utilities/model.py` chooses the model endpoint (`MODEL_URL`/`MODEL_KEY`) and
   writes the credential Secret it resolves
 - `conftest.py` — session fixtures for the context, namespace and API clients
-- `pyproject.toml` — `kubernetes` and `pytest` dependencies plus the `ruff`
-  configuration; the make targets prepare the environment and run them
+- `pyproject.toml` — the dependencies (`kubernetes`, `pytest`, `requests`,
+  `cryptography`) with the `pytest-html` and `ruff` dev group, the marker
+  registry, and the `ruff` configuration; `uv.lock` pins them and the make
+  targets run them through `uv`
 
 `make lint` runs `ruff check` and `ruff format --check`; `make fmt` fixes both.
 `.github/workflows/python-lint.yaml` runs `make lint` in CI on pushes to
