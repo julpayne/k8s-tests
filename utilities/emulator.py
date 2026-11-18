@@ -2,7 +2,8 @@
 
 The checks own the emulator: a fixture applies it, a fixture removes it, and the
 namespace, image, port and token are all parameters. Nothing is baked into the
-cluster ahead of the run.
+cluster ahead of the run. When `MODEL_URL` names a real endpoint there is nothing
+to deploy, and the checks call that instead (see `utilities/model.py`).
 
 The emulator image has no notion of credentials, so the deployment mounts a
 wrapper over it from a ConfigMap (`hack/emulator/auth_emulator.py`) and starts
@@ -25,6 +26,7 @@ from kubernetes import client
 from kubernetes.client.exceptions import ApiException
 
 from utilities.kube import namespace_from_env, wait_for_deployment_available
+from utilities.model import MODEL_CREDENTIALS_KEY, external_model_key, external_model_url
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,7 +40,7 @@ DEFAULT_TOKEN = "trustyai-emulator-token"
 
 TOKEN_VAR = "EMULATOR_TOKEN"
 IMAGE_VAR = "EMULATOR_IMG"
-CREDENTIAL_KEY = "api-key"
+CREDENTIAL_KEY = MODEL_CREDENTIALS_KEY
 HEALTH_PATH = "/health"
 AUTH_STATE_PATH = "/__auth/state"
 COMPLETIONS_PATH = "/v1/completions"
@@ -68,7 +70,12 @@ def emulator_image() -> str:
 
 
 def emulator_token() -> str:
-    return os.environ.get(TOKEN_VAR) or DEFAULT_TOKEN
+    """The token the emulator requires.
+
+    MODEL_KEY is the credential the job checks use, and the emulator has to
+    accept the same value when no MODEL_URL points the checks at a real endpoint.
+    """
+    return external_model_key() or os.environ.get(TOKEN_VAR) or DEFAULT_TOKEN
 
 
 def credential_secret_name() -> str:
@@ -80,8 +87,12 @@ def wrapper_config_map_name() -> str:
 
 
 def model_url(namespace: str) -> str:
-    """In-cluster base URL an EvalHub job uses as its model endpoint."""
-    return f"http://{emulator_name()}.{namespace}.svc.cluster.local:{emulator_port()}/v1"
+    """The model endpoint an EvalHub job submits.
+
+    MODEL_URL, when set, is a real endpoint the fixtures do not deploy; the
+    emulator's in-cluster URL is the default.
+    """
+    return external_model_url() or f"http://{emulator_name()}.{namespace}.svc.cluster.local:{emulator_port()}/v1"
 
 
 def _labels() -> dict[str, str]:

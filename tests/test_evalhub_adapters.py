@@ -1,10 +1,10 @@
 """Checks for the EvalHub adapters: the section that runs real benchmarks.
 
 Each job here hands one benchmark of the `lm_evaluation_harness` provider to its
-adapter through the EvalHub API, against the LLM emulator the fixtures deploy,
-waits for the adapter to finish in the cluster, and reads the result back.
-`BENCHMARKS` is what the section covers; a new benchmark is one entry there, and
-every check below then runs once for it.
+adapter through the EvalHub API, against the LLM emulator the fixtures deploy or,
+when `MODEL_URL` is set, a real endpoint, waits for the adapter to finish in the
+cluster, and reads the result back. `BENCHMARKS` is what the section covers; a new
+benchmark is one entry there, and every check below then runs once for it.
 
 The section carries the `adapters` marker and nothing else, so it is selected on
 its own (`make test-evalhub-adapters`, or `-m adapters`) and left out of the
@@ -23,15 +23,15 @@ from typing import Any
 
 import pytest
 
-from utilities.emulator import auth_state, model_url
+from utilities.emulator import auth_state
 from utilities.evalhub import api_headers, benchmark_result, submit_job, wait_for_job
+from utilities.model import ModelEndpoint
 
 LOGGER = logging.getLogger(__name__)
 
 pytestmark = [pytest.mark.adapters]
 
 LM_EVAL_PROVIDER = "lm_evaluation_harness"
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 # One example: enough for the harness to score, small enough for a Kind cluster.
 DEFAULT_NUM_EXAMPLES = 1
 # Longer than the harness smoke job's budget: a cold run pulls the adapter image
@@ -56,14 +56,13 @@ class Benchmark:
 BENCHMARKS: tuple[Benchmark, ...] = (Benchmark(id="ethics_cm", primary_metric="acc"),)
 
 
-def job_payload(benchmark: Benchmark, emulator_namespace: str, credentials_secret: str) -> dict[str, Any]:
-    """The job body a user would submit for one benchmark against the emulator."""
-    return {
-        "name": f"emulator-{benchmark.id}",
+def job_payload(benchmark: Benchmark, model: ModelEndpoint, credentials_secret: str | None) -> dict[str, Any]:
+    """The job body a user would submit for one benchmark against the model."""
+    payload: dict[str, Any] = {
+        "name": f"model-{benchmark.id}",
         "model": {
-            "url": model_url(emulator_namespace),
-            "name": MODEL_NAME,
-            "auth": {"secret_ref": credentials_secret},
+            "url": model.url,
+            "name": model.name,
         },
         "benchmarks": [
             {
@@ -73,6 +72,9 @@ def job_payload(benchmark: Benchmark, emulator_namespace: str, credentials_secre
             }
         ],
     }
+    if credentials_secret:
+        payload["model"]["auth"] = {"secret_ref": credentials_secret}
+    return payload
 
 
 @pytest.fixture(scope="module", params=BENCHMARKS, ids=[benchmark.id for benchmark in BENCHMARKS])
@@ -87,14 +89,13 @@ def submitted(
     evalhub_api_base: str,
     evalhub_tenant_token: str,
     evalhub_tenant_namespace: str,
-    evalhub_model_credentials: str,
-    emulator_namespace: str,
-    emulator_url: str,
+    evalhub_model_credentials: str | None,
+    model_endpoint: ModelEndpoint,
 ) -> dict[str, Any]:
     """Submit the benchmark's job, recording what the emulator had seen before it."""
-    payload = job_payload(benchmark, emulator_namespace, evalhub_model_credentials)
+    payload = job_payload(benchmark, model_endpoint, evalhub_model_credentials)
     headers = api_headers(evalhub_tenant_token, evalhub_tenant_namespace)
-    before = auth_state(emulator_url)
+    before = auth_state(model_endpoint.state_url) if model_endpoint.state_url else None
     job = submit_job(evalhub_api_base, headers, payload)
     return {"job": job, "headers": headers, "payload": payload, "auth_before": before}
 
@@ -175,14 +176,22 @@ def test_the_result_reports_the_provider_test_outcome(finished: dict[str, Any], 
         )
 
 
-def test_the_job_reached_the_model(finished: dict[str, Any], submitted: dict[str, Any], emulator_url: str) -> None:
+def test_the_job_reached_the_model(
+    finished: dict[str, Any],
+    submitted: dict[str, Any],
+    model_endpoint: ModelEndpoint,
+) -> None:
     """The emulator authenticated the job's model requests, so the job did the work.
 
     A job can reach `completed` without the model being called at all (a cached
     result, a misconfigured endpoint that answers anyway), so this reads the
-    emulator's own count instead of trusting the job's verdict.
+    emulator's own count instead of trusting the job's verdict. A real endpoint
+    does not report what it authenticated, so the check skips rather than
+    pretending the job's own verdict proves the model was called.
     """
-    state = auth_state(emulator_url)
+    if not model_endpoint.observes_requests or not model_endpoint.state_url:
+        pytest.skip(f"MODEL_URL is set ({model_endpoint.url}); a real endpoint does not report the requests it served")
+    state = auth_state(model_endpoint.state_url)
     before = submitted["auth_before"]
     assert state["authenticated_requests"] > before["authenticated_requests"], (
         f"job {finished['resource']['id']} reported {finished['status']['state']} but the emulator authenticated "

@@ -84,6 +84,9 @@ platform operator would.
 | `KIND_PROVIDER` | auto | Force `podman` or `docker` on hosts that have both |
 | `NAMESPACE` | `system` | Namespace both operators are deployed into |
 | `KUBECTL` | `kubectl` | kubectl the harness and the checks shell out to, including the token the API checks mint |
+| `MODEL_URL` | *(empty)* | OpenAI-compatible base URL the job checks call instead of the emulator; setting it stops the fixtures deploying the emulator |
+| `MODEL_KEY` | *(empty)* | Credential for `MODEL_URL`; the fixtures write it to the `model-credentials` Secret under `api-key`, which the job names in `model.auth.secret_ref` |
+| `MODEL_NAME` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Model name a job submits |
 | `WORKLOAD_IMG` | `localhost/trustyai-service-operator:dev` | Workload operator image reference |
 | `MODULE_IMG` | `localhost/trustyai-operator-module:dev` | Module operator image reference |
 | `EVALHUB_IMG` | *(empty)* | EvalHub operand image; empty keeps the operator's own pin (`quay.io/evalhub/evalhub:latest`) |
@@ -137,13 +140,30 @@ documented under [LLM emulator](#llm-emulator).
 
 ## LLM emulator
 
-The checks that call a model use an emulator: the `vllm_emulator` image, which
-answers OpenAI-shaped `/v1/completions` and `/v1/chat/completions` without a GPU.
+The checks that call a model use an emulator by default: the `vllm_emulator`
+image, which answers OpenAI-shaped `/v1/completions` and `/v1/chat/completions`
+without a GPU.
 
-The tests own it. `tests/conftest.py` deploys it into the namespace under test
-(and removes it afterwards), so `make up` leaves no emulator behind and a run
-cannot depend on one someone left in the cluster. The image, namespace, port and
-token are parameters:
+Set `MODEL_URL` to call a real, OpenAI-compatible endpoint instead. The fixtures
+then deploy no emulator, so the checks run against a cluster that already serves
+a model, and the emulator checks skip. `MODEL_KEY`, when set, is the credential
+that endpoint requires: the fixtures create a `model-credentials` Secret in the
+tenant namespace with the value under `api-key`, the key a job's
+`model.auth.secret_ref` resolves, so the job payload never carries it.
+`MODEL_NAME` overrides the model name a job submits.
+
+```sh
+make test MODEL_URL=http://model.example.svc:8000/v1 MODEL_KEY=sk-...
+make test MODEL_URL=http://model.example.svc:8000/v1 MODEL_NAME=granite-3b
+```
+
+Without `MODEL_URL`, `MODEL_KEY` is also the token the emulator requires, so the
+credential plumbing can be exercised with a key of your own.
+
+The tests own the emulator. `tests/conftest.py` deploys it into the namespace
+under test (and removes it afterwards), so `make up` leaves no emulator behind
+and a run cannot depend on one someone left in the cluster. The image, namespace,
+port and token are parameters:
 
 ```sh
 make test                                  # default emulator, namespace and token
@@ -169,13 +189,15 @@ EvalHub API and reads its results:
 
 - a ServiceAccount in a tenant namespace, granted the API by the RBAC the proxy
   authorizes against, minted as a bearer token by `kubectl create token`;
-- a `model.auth.secret_ref` Secret in that namespace carrying `api-key`, the
-  emulator's token;
+- a `model.auth.secret_ref` Secret in that namespace carrying `api-key`: the
+  emulator's token, or `MODEL_KEY` when set. With `MODEL_KEY` the Secret has the
+  known name `model-credentials`; otherwise it is `emulator-credentials`;
 - the instance certificate copied into the tenant's `evalhub-service-ca`
   ConfigMap, which OpenShift's service CA would fill in and Kind cannot, so the
   evaluation sidecar can verify the instance it reports back to;
 - the `arc_easy` benchmark of the `lm_evaluation_harness` provider with
-  `num_examples: 1`, against the emulator's in-cluster URL.
+  `num_examples: 1`, against the emulator's in-cluster URL or `MODEL_URL` when
+  that is set.
 
 It is the harness's own end-to-end check of the API, the sidecar and the
 credential, so it stays in `make test`. Benchmarks that are the point of the run
@@ -185,10 +207,13 @@ one per entry in its table.
 The job runs in the cluster: the adapter container calls the model through the
 EvalHub sidecar, which injects the credential. The checks assert the job reaches
 `completed`, that `results.benchmarks[0]` carries the benchmark id, provider and
-numeric metrics, and that the emulator saw the tenant Secret's token on a `/v1`
-path. The first run of the day is the slow one - the adapter image has to be pulled and
-the job scheduled (about six minutes on a cold Kind node); afterwards the run is
-about a minute. It is marked `benchmark`, so it can be filtered out:
+numeric metrics, and, when the model is the emulator, that it saw the tenant
+Secret's token on a `/v1` path. A real endpoint does not report what it
+authenticated, so that last check skips rather than pretending the job's own
+verdict proves the credential arrived. The first run of the day is the slow one -
+the adapter image has to be pulled and the job scheduled (about six minutes on a
+cold Kind node); afterwards the run is about a minute. It is marked `benchmark`,
+so it can be filtered out:
 
 ```sh
 make test PYTEST_ARGS="-m 'not benchmark'"
@@ -202,16 +227,18 @@ waited for until the adapter finishes in the cluster, and read back as a result.
 It covers one today, `ethics_cm` (commonsense moral judgment) of the
 `lm_evaluation_harness` provider with `num_examples: 1`; adding a benchmark is one
 more entry in that table, and every check then runs once for it, under a
-`[<benchmark>]` id.
+`[<benchmark>]` id. Its jobs call the same endpoint the benchmark job does: the
+emulator the fixtures deploy, or `MODEL_URL` when that is set, with `MODEL_KEY` as
+the credential.
 
 For each benchmark the section asserts that the job is accepted with exactly that
 benchmark, its provider and its `num_examples`; that the job and the benchmark
 alone reach `completed`; that `results.benchmarks[]` carries the benchmark, its
 provider and numeric metrics; that the metric the provider config scores it on
 (`acc` for `ethics_cm`) is among those metrics and is a rate; that the provider's
-pass criteria turn the score into a `test` block; and that the emulator
-authenticated the job's model requests, so the model was called rather than the
-job merely reporting success.
+pass criteria turn the score into a `test` block; and, when the model is the
+emulator, that it authenticated the job's model requests, so the model was called
+rather than the job merely reporting success.
 
 The section carries the `adapters` marker and nothing else, in both directions:
 the EvalHub instance checks are `evalhub` and never select it, and it never
@@ -268,9 +295,9 @@ operators.
 | `tests/test_trustyai_operators.py` | the harness smoke checks: both operator Deployments exist, ask for a single replica, and are healthy (`Available`, the desired replicas ready, their pods `Running` with every container ready) |
 | `tests/test_trustyai_module.py` | the modular stack: the module CRD is installed, both operator Deployments are available, `TrustyAI/default-trustyai` reports `Ready=True` with `ProvisioningSucceeded=True` and an up-to-date `observedGeneration`, and the module operator runs the built image |
 | `tests/test_trustyai_workload.py` | the workload operator image: it matches the `RELATED_IMAGE_*` value the module operator renders it from, the image the harness built, and the operator's own ConfigMap |
-| `tests/test_emulator.py` | the LLM emulator: its Deployment runs the pinned image and is healthy, `/health` needs no token, `/v1/completions` and `/v1/chat/completions` answer `401` without the token or with another one and `200` with the token from the `vllm-emulator-auth` Secret, that Secret carries the `api-key` key `model.auth.secret_ref` resolves, and the token check reports which token fingerprint it saw |
-| `tests/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and the emulator saw the tenant Secret's token on a `/v1` request |
-| `tests/test_evalhub_adapters.py` | the EvalHub adapters section (opt-in, `make test-evalhub-adapters`): each benchmark in its table - currently `ethics_cm` of `lm_evaluation_harness`, with `num_examples: 1` against the emulator - is accepted as the job's only benchmark, reaches `completed`, reports the benchmark, provider, numeric metrics and the `acc` its provider scores it on, turns its pass criteria into a test outcome, and the emulator authenticated the model requests it made |
+| `tests/test_emulator.py` | the LLM emulator (skipped when `MODEL_URL` is set): its Deployment runs the pinned image and is healthy, `/health` needs no token, `/v1/completions` and `/v1/chat/completions` answer `401` without the token or with another one and `200` with the token from the `vllm-emulator-auth` Secret, that Secret carries the `api-key` key `model.auth.secret_ref` resolves, and the token check reports which token fingerprint it saw |
+| `tests/test_evalhub_benchmark.py` | a benchmark job: the API accepts a job for `arc_easy` with `num_examples: 1` against the emulator or `MODEL_URL`, it reaches `completed`, its results carry the benchmark id, provider and numeric metrics, and - against the emulator - the emulator saw the tenant Secret's token (or `MODEL_KEY`) on a `/v1` request |
+| `tests/test_evalhub_adapters.py` | the EvalHub adapters section (opt-in, `make test-evalhub-adapters`): each benchmark in its table - currently `ethics_cm` of `lm_evaluation_harness`, with `num_examples: 1` against the emulator or `MODEL_URL` - is accepted as the job's only benchmark, reaches `completed`, reports the benchmark, provider, numeric metrics and the `acc` its provider scores it on, turns its pass criteria into a test outcome, and - against the emulator - the emulator authenticated the model requests it made |
 | `tests/test_trustyai_service.py` | the TrustyAI service: the CRD serves `v1` and `v1alpha1` through a conversion webhook and a resource created as one reads back as the other; the operand rolls out one replica with the `trustyai-service`, `kube-rbac-proxy` and `internal-tls-proxy` containers, runs the requested image, carries the resource's schedule and storage settings, and mounts a bound claim at the requested size; `/q/health` answers `healthy` unauthenticated; `/info` needs a token and refuses one without the grant; both halves of a drift comparison upload and are counted; CompareMeans detects the shifted distribution; and a scheduled metric is listed once and deleted |
 | `tests/test_evalhub.py` | EvalHub: the CRD serves `v1` and `v1alpha1` through a conversion webhook; the instance the tests create reads back through both versions, reports `Ready`, runs one pod with the `evalhub` and `kube-rbac-proxy` containers and the labels the Service selects on; a namespace labelled as a tenant receives the discovery and CA ConfigMaps; and `/api/v1/health` answers `200` (and `405` to non-GET methods) |
 
@@ -375,8 +402,10 @@ Layout:
   fixture that skips the module checks when a cluster does not run the modular
   stack
 - `utilities/` — helpers shared by the tests; `utilities/kube.py` loads the
-  clients and turns Deployment and pod status into readable failures, and
-  `utilities/trustyai.py` holds the module, workload and image helpers
+  clients and turns Deployment and pod status into readable failures,
+  `utilities/trustyai.py` holds the module, workload and image helpers, and
+  `utilities/model.py` chooses the model endpoint (`MODEL_URL`/`MODEL_KEY`) and
+  writes the credential Secret it resolves
 - `conftest.py` — session fixtures for the context, namespace and API clients
 - `pyproject.toml` — the dependencies (`kubernetes`, `pytest`, `requests`,
   `cryptography`) with the `pytest-html` and `ruff` dev group, the marker

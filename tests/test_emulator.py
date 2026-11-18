@@ -5,7 +5,8 @@ check, with the token in the `<name>-auth` Secret under the key EvalHub resolves
 `model.auth.secret_ref` to. These checks pin that contract: a request carrying
 the secret's token succeeds, and a request without it, or with another token, is
 rejected, which is what lets an adapter check tell a forwarded credential from a
-dropped one.
+dropped one. With `MODEL_URL` set the checks call a real endpoint instead and
+this module skips, because there is no emulator to pin.
 """
 
 from __future__ import annotations
@@ -122,7 +123,7 @@ def test_the_credential_secret_has_the_key_evalhub_resolves(
     assert emulator_credentials == emulator_token(), "the Secret does not carry the configured token"
 
 
-def test_the_model_url_is_the_one_a_job_would_use(emulator_namespace: str) -> None:
+def test_the_model_url_is_the_one_a_job_would_use(emulator: client.V1Deployment, emulator_namespace: str) -> None:
     """The in-cluster URL a job submits, so a check never has to guess it."""
     url = model_url(emulator_namespace)
     assert url == f"http://{emulator_name()}.{emulator_namespace}.svc.cluster.local:8000/v1"

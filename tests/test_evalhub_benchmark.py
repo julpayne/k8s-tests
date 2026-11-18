@@ -1,10 +1,11 @@
-"""Checks for an evaluation job that creates a benchmark against the emulator.
+"""Checks for an evaluation job that creates a benchmark against the model.
 
 The job is the smallest real one the harness can run: one benchmark, one dataset
-example, against the LLM emulator the fixtures deploy. It exercises the whole
-path an adapter takes - provider, model URL, model credential - and the emulator
-is strict about the credential, so the checks can prove the token in the tenant
-Secret reached the model rather than the run merely finishing.
+example, against the LLM emulator the fixtures deploy or, when `MODEL_URL` is
+set, a real endpoint. It exercises the whole path an adapter takes - provider,
+model URL, model credential - and the emulator is strict about the credential, so
+the checks can prove the token in the tenant Secret reached the model rather than
+the run merely finishing.
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ from typing import Any
 
 import pytest
 
-from utilities.emulator import auth_state, model_url
+from utilities.emulator import auth_state
 from utilities.evalhub import api_headers, benchmark_result, submit_job, wait_for_job
+from utilities.model import ModelEndpoint
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,17 +29,15 @@ PROVIDER_ID = "lm_evaluation_harness"
 # One example: enough to score, small enough to run in a Kind cluster.
 NUM_EXAMPLES = 1
 JOB_TIMEOUT = 900
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
-def job_payload(emulator_namespace: str, credentials_secret: str) -> dict[str, Any]:
-    """The job body a user would submit for one benchmark against the emulator."""
-    return {
-        "name": f"emulator-{BENCHMARK_ID}",
+def job_payload(model: ModelEndpoint, credentials_secret: str | None) -> dict[str, Any]:
+    """The job body a user would submit for one benchmark against the model."""
+    payload: dict[str, Any] = {
+        "name": f"model-{BENCHMARK_ID}",
         "model": {
-            "url": model_url(emulator_namespace),
-            "name": MODEL_NAME,
-            "auth": {"secret_ref": credentials_secret},
+            "url": model.url,
+            "name": model.name,
         },
         "benchmarks": [
             {
@@ -47,6 +47,9 @@ def job_payload(emulator_namespace: str, credentials_secret: str) -> dict[str, A
             }
         ],
     }
+    if credentials_secret:
+        payload["model"]["auth"] = {"secret_ref": credentials_secret}
+    return payload
 
 
 @pytest.fixture(scope="module")
@@ -54,14 +57,13 @@ def submitted(
     evalhub_api_base: str,
     evalhub_tenant_token: str,
     evalhub_tenant_namespace: str,
-    evalhub_model_credentials: str,
-    emulator_namespace: str,
-    emulator_url: str,
+    evalhub_model_credentials: str | None,
+    model_endpoint: ModelEndpoint,
 ) -> dict[str, Any]:
     """Submit the job, recording what the emulator had seen before it."""
-    payload = job_payload(emulator_namespace, evalhub_model_credentials)
+    payload = job_payload(model_endpoint, evalhub_model_credentials)
     headers = api_headers(evalhub_tenant_token, evalhub_tenant_namespace)
-    before = auth_state(emulator_url)
+    before = auth_state(model_endpoint.state_url) if model_endpoint.state_url else None
     job = submit_job(evalhub_api_base, headers, payload)
     return {"job": job, "headers": headers, "payload": payload, "auth_before": before}
 
@@ -128,16 +130,19 @@ def test_the_benchmark_reports_a_test_outcome(finished: dict[str, Any]) -> None:
 def test_the_token_reached_the_model(
     finished: dict[str, Any],
     submitted: dict[str, Any],
-    emulator_url: str,
-    emulator_credentials: str,
+    model_endpoint: ModelEndpoint,
 ) -> None:
     """The emulator saw the tenant Secret's token on the job's model requests.
 
     This is the point of the credential plumbing: the job's `model.auth.secret_ref`
     resolves to `api-key`, the sidecar injects it, and the emulator rejects
     anything else - so an authenticated request can only come from that token.
+    A real endpoint does not report what it authenticated, so the check skips
+    rather than pretending the job's own verdict proves the credential arrived.
     """
-    state = auth_state(emulator_url)
+    if not model_endpoint.observes_requests or not model_endpoint.state_url:
+        pytest.skip(f"MODEL_URL is set ({model_endpoint.url}); a real endpoint does not report the requests it served")
+    state = auth_state(model_endpoint.state_url)
     before = submitted["auth_before"]
     assert state["authenticated_requests"] > before["authenticated_requests"], (
         f"the job completed but the emulator authenticated no model request; before={before}, after={state}"
@@ -145,7 +150,8 @@ def test_the_token_reached_the_model(
     assert state["last_authenticated_path"].startswith("/v1/"), (
         f"the last authenticated request was {state['last_authenticated_path']!r}, not a model endpoint"
     )
-    fingerprint = hashlib.sha256(emulator_credentials.encode()).hexdigest()[:16]
+    assert model_endpoint.credential, "the emulator endpoint has no credential to compare"
+    fingerprint = hashlib.sha256(model_endpoint.credential.encode()).hexdigest()[:16]
     assert fingerprint in state["presented_fingerprints"], (
         "the emulator did not see the tenant Secret's token; it saw "
         f"{state['presented_fingerprints']} instead of {fingerprint}"
