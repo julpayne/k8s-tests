@@ -209,6 +209,18 @@ documented under [LLM emulator](#llm-emulator).
   it adopts the resource it finds.
 - Image tags other than `latest` are important: `latest` would make Kubernetes
   pull instead of using the image loaded into the node.
+- The operand images the operator pins are published for `linux/amd64` only:
+  `quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable`, and `ta-lmes-job` and
+  `ta-lmes-driver` in the same overlay. On an arm64 host, such as an Apple Silicon
+  laptop, the operand pods stay in `ImagePullBackOff` (`no match for platform in
+  manifest`) and the rollout wait fails with the pod's reason in the timeout
+  message. Point the run at an amd64 cluster, or give the module operator an arm64
+  build of the proxy through `RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE`
+  (`kubectl -n system set env deployment/trustyai-operator-module-controller-manager
+  RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE=<ref>`, then touch the module resource so
+  the workload operator is rendered again). The upstream
+  `quay.io/brancz/kube-rbac-proxy` is multi-arch but lacks the ODH
+  `--tls-curve-preferences` flag, so it cannot stand in for it.
 - On hosts without the `docker` CLI the harness exports each image with
   `podman save` and loads it with `kind load image-archive`, since
   `kind load docker-image` always shells out to `docker`.
