@@ -106,7 +106,10 @@ def _container_not_ready_reason(status: client.V1ContainerStatus) -> str:
     if state is None:
         return "no state reported"
     if state.waiting is not None:
-        return f"waiting: {state.waiting.reason}"
+        # The message is where the kubelet says why: an image that has no manifest
+        # for the node's architecture, a certificate it cannot read, and so on.
+        waiting = state.waiting
+        return f"waiting: {waiting.reason}: {waiting.message}" if waiting.message else f"waiting: {waiting.reason}"
     if state.terminated is not None:
         return f"terminated: {state.terminated.reason}"
     return "running but not ready"
@@ -233,8 +236,17 @@ def wait_for_deployment_available(
         )
         time.sleep(interval)
         deployment = read_deployment(apps_client, name=name, namespace=namespace)
+    # The Deployment's conditions only say that the rollout is still in progress;
+    # the pods say why, and an image the node cannot pull is otherwise a timeout
+    # with no cause in it.
+    problems: list[str] = []
+    if core_client is not None:
+        for pod in _pods_for(deployment, core_client, namespace):
+            problems.extend(_pod_problems(pod))
+    details = "".join(f"\n  - {problem}" for problem in problems)
     pytest.fail(
-        f"deployment {namespace}/{name} did not become available within {timeout}s: {_describe_conditions(deployment)}",
+        f"deployment {namespace}/{name} did not become available within {timeout}s: "
+        f"{_describe_conditions(deployment)}{details}",
         pytrace=False,
     )
 
