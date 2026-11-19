@@ -186,7 +186,7 @@ a marker of your own belongs in `pyproject.toml` next to the others.
 | `TRUSTYAI_SERVICE_IMG` | `quay.io/trustyai/trustyai-service:latest` | TrustyAI service operand image, passed through `RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_PY_IMAGE`; set it to a build under test |
 | `TAG` | `dev` | Tag used by both image references |
 | `IMAGE_PREFIX` | `localhost` | Registry/repository prefix used by both image references |
-| `ENGINE` | auto | `podman` or `docker`; detected when unset |
+| `ENGINE` | auto | `podman` or `docker`; `docker` wins when both are installed, so set `ENGINE=podman` to build, save and remove the images with podman |
 | `TIMEOUT` | `300s` | Timeout for each readiness wait |
 | `PYTEST_ARGS` | *(empty)* | Extra pytest arguments, e.g. `-m module`, `-m lmeval`, `-m adapters` or `-k evalhub` |
 | `REPORT_FILE` | `reports/report.html` | Report written by `make test` and `make test-all` |
@@ -212,6 +212,13 @@ documented under [LLM emulator](#llm-emulator).
 - On hosts without the `docker` CLI the harness exports each image with
   `podman save` and loads it with `kind load image-archive`, since
   `kind load docker-image` always shells out to `docker`.
+- `make images` passes `--load` to `docker build`. The `docker` CLI builds with
+  buildx, and when the active builder uses the `docker-container` driver a build
+  without `--load` prints `No output specified with docker-container driver` and
+  leaves the image only in the builder's cache, so `make load` fails with
+  `Error response from daemon: localhost/trustyai-service-operator:dev: image not
+  known`. `ENGINE=podman` sidesteps buildx and its builder configuration
+  altogether.
 - The module image bakes the workload operator manifests at build time. If
   `config/` and `trustyai-operator-module/config/manifests-template/` have
   drifted, `make images` warns; refresh the template with
