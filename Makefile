@@ -184,7 +184,7 @@ up: check-operator-repo cluster images load deploy ## Create the cluster, build,
 down: cluster-delete ## Delete the Kind cluster.
 
 .PHONY: clean
-clean: ## Delete the built operator images and the HTML report (leaves the cluster).
+clean: ## Delete the built images, the local registry and the HTML report (leaves the cluster).
 	hack/clean.sh
 
 .PHONY: test

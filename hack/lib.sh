@@ -205,7 +205,7 @@ registry_name() { printf 'k8s-tests-registry-%s' "${KIND_CLUSTER:-trustyai}"; }
 # published on 127.0.0.1:${REGISTRY_PORT}, and sets REGISTRY_ALIAS to the name
 # the nodes resolve it by.
 ensure_registry() {
-	local engine name alias networks mapping status attempt
+	local engine name alias networks mapping status
 	engine=$(container_engine)
 	name=$(registry_name)
 	REGISTRY_PORT=${REGISTRY_PORT:-5005}
@@ -240,7 +240,7 @@ ensure_registry() {
 		"$engine" network connect --alias "$alias" kind "$name" >/dev/null
 	fi
 
-	for attempt in {1..30}; do
+	for _ in {1..30}; do
 		curl --silent --fail "http://127.0.0.1:${REGISTRY_PORT}/v2/" >/dev/null 2>&1 && return 0
 		sleep 1
 	done

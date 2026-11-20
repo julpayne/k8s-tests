@@ -56,8 +56,10 @@ make deploy     # deploy the module operator, pointing it at the built images
 the flag when it is missing or does not look like an operator checkout.
 
 Tear the cluster down with `make down`; `make clean` also deletes the images
-the harness built and the HTML reports (`reports/`), without touching the
-cluster.
+the harness built, the local registry container `make images-all` starts, and the
+HTML reports (`reports/`, the `images.env` record of what was deployed included),
+without touching the cluster. With podman or Docker stopped it still removes the
+reports and leaves the images and the registry for a later run.
 
 ### Building every image locally (local registry)
 

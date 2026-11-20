@@ -29,13 +29,21 @@ fi
 # A just-started node needs a moment before the API server answers; without this
 # the kubectl wait in `make cluster` races it and fails with "the server doesn't
 # have a resource type". TIMEOUT is the deadline that wait uses next, so allow
-# the same here.
+# the same here: its single-unit h/m/s form (and a bare number of seconds) becomes
+# seconds, and anything else - a compound 1h30m, say - falls back to the default
+# instead of feeding the arithmetic a value it cannot take.
 timeout=${TIMEOUT:-300s}
-case "$timeout" in
-*s) timeout=${timeout%s} ;;
-*m) timeout=$((${timeout%m} * 60)) ;;
-esac
-[[ "$timeout" =~ ^[0-9]+$ ]] || timeout=300
+seconds=""
+if [[ "$timeout" =~ ^[0-9]+$ ]]; then
+	seconds=$timeout
+elif [[ "$timeout" =~ ^([0-9]+)([smh])$ ]]; then
+	case "${BASH_REMATCH[2]}" in
+	s) seconds=${BASH_REMATCH[1]} ;;
+	m) seconds=$((BASH_REMATCH[1] * 60)) ;;
+	h) seconds=$((BASH_REMATCH[1] * 3600)) ;;
+	esac
+fi
+timeout=${seconds:-300}
 context=${KUBE_CONTEXT:-kind-$cluster}
 deadline=$((SECONDS + timeout))
 while ((SECONDS < deadline)); do
