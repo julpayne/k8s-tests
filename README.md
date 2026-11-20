@@ -123,10 +123,14 @@ How the images reach the cluster:
   `--tls-verify=false`. With Docker, the daemon must allow the local registry
   (`insecure-registries`) or the push fails with `server gave HTTP response to
   HTTPS client`.
-- The registry container is reused between runs; `make clean` removes it and the
-  images `reports/images.env` records, leaving other images under the registry
-  prefix alone. With podman or Docker stopped it still removes `reports/` and
-  leaves the images and the registry for a later run.
+- The registry container is reused between runs; `make clean` removes it, so
+  everything it held is gone - including an image you pushed to it by hand, such
+  as the kube-rbac-proxy build in Troubleshooting, which has to be pushed again
+  before the next `deploy`. It also removes the local copies of the images
+  `reports/images.env` records, and leaves the images under the registry prefix
+  that the file does not record in the engine's store alone. With podman or
+  Docker stopped it still removes `reports/` and leaves the images and the
+  registry for a later run.
 - On a small podman machine the adapter images fill the VM quickly. Pass
   `REMOVE_AFTER_PUSH=true` to `images-all` to drop each local copy once it is
   pushed (the registry keeps it), and prefer `ADAPTERS=lmes` over `ADAPTERS=all`

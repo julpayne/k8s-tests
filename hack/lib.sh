@@ -97,6 +97,22 @@ kube() {
 	"${KUBECTL:-kubectl}" --context "${KUBE_CONTEXT:-kind-kind}" "$@"
 }
 
+# images_env_path prints where the image references live: IMAGES_ENV_FILE when it
+# is set, resolved against this checkout the way make resolves it, and
+# reports/images.env otherwise. hack/build-images.sh, hack/build-all-images.sh,
+# hack/deploy.sh, hack/clean.sh and utilities/trustyai.py all read or write that
+# one file, so they have to agree on the path even when a script is invoked from
+# another directory.
+images_env_path() {
+	local path=${IMAGES_ENV_FILE:-reports/images.env} root
+	if [[ "$path" == /* ]]; then
+		printf '%s' "$path"
+		return
+	fi
+	root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+	printf '%s/%s' "$root" "$path"
+}
+
 # split_image sets IMG_NAME and IMG_TAG for "registry:port/name:tag" style refs.
 split_image() {
 	local ref=$1
@@ -115,22 +131,37 @@ require_operator_repo() {
 	[[ -d "$OPERATOR_REPO" ]] || die "OPERATOR_REPO=$OPERATOR_REPO does not exist"
 }
 
+# normalize_arch maps the names the kernel and the engines report onto the GOARCH
+# names the build tools use. `uname -m` and moby's Info.Architecture (the running
+# platform, so x86_64 on amd64 hardware and aarch64 on arm64) say x86_64/aarch64,
+# while `--platform` and BuildKit's automatic TARGETARCH say amd64/arm64: passing
+# a non-GOARCH value as --build-arg TARGETARCH overrides the one BuildKit fills in
+# with something no Dockerfile switches on.
+normalize_arch() {
+	case "$1" in
+	x86_64 | x86-64) printf 'amd64' ;;
+	aarch64) printf 'arm64' ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
 # host_platform prints the platform images should be built for: the engine's own
-# OS/arch, which is linux/arm64 on Apple Silicon and linux/amd64 on Intel/Linux.
+# OS/arch, which is linux/arm64 on Apple Silicon and linux/amd64 on Intel/Linux,
+# named the way --platform and TARGETARCH expect it.
 host_platform() {
-	local engine platform
+	local engine platform machine
 	engine=$(container_engine)
 	if [[ "$engine" == docker ]]; then
 		platform=$(docker info --format '{{.OSType}}/{{.Architecture}}' 2>/dev/null || true)
 		if [[ -n "$platform" ]]; then
-			printf '%s' "$platform"
+			printf '%s/%s' "${platform%%/*}" "$(normalize_arch "${platform##*/}")"
 			return
 		fi
 	fi
-	case "$(uname -m)" in
-	arm64 | aarch64) printf 'linux/arm64' ;;
-	x86_64 | amd64) printf 'linux/amd64' ;;
-	*) die "unsupported host architecture: $(uname -m)" ;;
+	machine=$(uname -m)
+	case "$machine" in
+	arm64 | aarch64 | x86_64 | amd64) printf 'linux/%s' "$(normalize_arch "$machine")" ;;
+	*) die "unsupported host architecture: $machine" ;;
 	esac
 }
 
@@ -221,7 +252,7 @@ ensure_registry() {
 # hack/kind/cluster.yaml; a cluster created before that patch has it enabled in
 # place (set PATCH_CONTAINERD=false to require a recreated cluster instead).
 configure_registry_mirrors() {
-	local engine node hosts nodes
+	local engine node hosts nodes state deadline
 	engine=$(container_engine)
 	hosts=$(mktemp)
 	printf '[host."http://%s:5000"]\n  capabilities = ["pull", "resolve"]\n' "$REGISTRY_ALIAS" >"$hosts"
@@ -233,6 +264,24 @@ configure_registry_mirrors() {
 	fi
 	while IFS= read -r node; do
 		[[ -n "$node" ]] || continue
+		# A node container left stopped - the podman machine was restarted and
+		# `make cluster` was not run since - cannot be exec'd into, and an exec
+		# failure is indistinguishable from a node whose config lacks certs.d.
+		# Start it here (what hack/start-cluster.sh does for `make cluster`) so the
+		# warning below only ever describes a config that really is missing.
+		state=$("$engine" container inspect --format '{{.State.Status}}' "$node" 2>/dev/null || true)
+		if [[ "$state" != running ]]; then
+			[[ -n "$state" ]] ||
+				die "kind node $node is not visible to $engine; set KIND_PROVIDER to the engine that created the cluster"
+			info "starting stopped kind node $node"
+			"$engine" container start "$node" >/dev/null
+			deadline=$((SECONDS + 60))
+			until "$engine" exec "$node" true >/dev/null 2>&1; do
+				((SECONDS < deadline)) ||
+					die "kind node $node did not accept exec within 60s of starting"
+				sleep 2
+			done
+		fi
 		if ! "$engine" exec "$node" grep -q 'certs.d' /etc/containerd/config.toml 2>/dev/null; then
 			if [[ "${PATCH_CONTAINERD:-true}" != true ]]; then
 				rm -f "$hosts"

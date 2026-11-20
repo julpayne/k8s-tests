@@ -10,8 +10,7 @@ TAG=${TAG:-dev}
 
 # Building the load-path images invalidates the references `make images-all`
 # records for the registry flow; tests read that file to know what was built.
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-rm -f "${IMAGES_ENV_FILE:-$repo_root/reports/images.env}"
+rm -f "$(images_env_path)"
 
 # `docker build` is buildx, and when the active builder uses the docker-container
 # driver the result is only kept in the builder's cache unless it is explicitly

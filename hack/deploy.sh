@@ -19,15 +19,16 @@ repo_root=$(cd "$here/.." && pwd)
 # reports/images.env is what `make images-all` pushed, what `deploy-registry`
 # passes in and what the checks read. Two things keep it in step with this
 # deployment: a key whose value this deploy does not use is dropped (so the tests
-# keep comparing against the references that do describe it), and the file is
-# rewritten with the header below, which is what utilities/trustyai.py requires
-# before it trusts the file. A build that was pushed but never deployed therefore
-# records nothing the checks would compare against.
+# keep comparing against the references that do describe it), and the header below
+# - which is what utilities/trustyai.py requires before it trusts the file - is
+# only written once the stack running those images is up (see the end of this
+# script). A build that was pushed but never deployed, and a deploy that failed
+# half way, therefore record nothing the checks would compare against.
 deployed_images_header="Written by hack/deploy.sh: the images this deployment runs"
-env_file=${IMAGES_ENV_FILE:-$repo_root/reports/images.env}
-[[ "$env_file" == /* ]] || env_file="$repo_root/$env_file"
+env_file=$(images_env_path)
+images_env_kept=""
 if [[ -f "$env_file" ]]; then
-	kept=$(mktemp)
+	images_env_kept=$(mktemp)
 	dropped=""
 	while IFS= read -r line; do
 		[[ -n "$line" && "$line" != "#"* && "$line" == *=* ]] || continue
@@ -38,19 +39,21 @@ if [[ -f "$env_file" ]]; then
 			dropped="${dropped:+$dropped }$key=$value"
 			continue
 		fi
-		printf '%s\n' "$line" >>"$kept"
+		printf '%s\n' "$line" >>"$images_env_kept"
 	done <"$env_file"
 	if [[ -n "$dropped" ]]; then
 		warn "$env_file records images this deploy does not use ($dropped); dropping them"
 	fi
-	if [[ -s "$kept" ]]; then
-		printf '# %s\n' "$deployed_images_header" >"$env_file"
-		cat "$kept" >>"$env_file"
+	if [[ -s "$images_env_kept" ]]; then
+		# Unstamped until the deploy below succeeds: an interrupted deployment
+		# must not leave a file the checks treat as a record of what is running.
+		cp "$images_env_kept" "$env_file"
 	else
 		warn "removing $env_file: it records no image this deploy uses"
 		rm -f "$env_file"
+		rm -f "$images_env_kept"
+		images_env_kept=""
 	fi
-	rm -f "$kept"
 fi
 
 module_config="$OPERATOR_REPO/trustyai-operator-module/config"
@@ -87,7 +90,7 @@ done
 split_image "$MODULE_IMG"
 module_name=$IMG_NAME module_tag=$IMG_TAG
 workdir=$(mktemp -d)
-trap 'rm -rf "$workdir"' EXIT
+trap 'rm -rf "$workdir"; [[ -z "${images_env_kept:-}" ]] || rm -f "$images_env_kept"' EXIT
 cp -a "$module_config" "$workdir/config"
 # EVALHUB_IMG overrides the operand image the module operator passes to the
 # workload operator through params.env.
@@ -253,6 +256,18 @@ info "applying the TrustyAI module resource and waiting for the workload operato
 	cd "$repo_root"
 	KUBE_CONTEXT="$KUBE_CONTEXT" NAMESPACE="$NAMESPACE" uv run --quiet python -m utilities.stack
 )
+
+# The module resource, the workload operator and the images it renders are up, so
+# the record can now say what this deployment runs. utilities/trustyai.py only
+# trusts a file carrying this header, and the checks compare the running images
+# against what it records.
+if [[ -n "$images_env_kept" ]]; then
+	printf '# %s\n' "$deployed_images_header" >"$env_file"
+	cat "$images_env_kept" >>"$env_file"
+	rm -f "$images_env_kept"
+	images_env_kept=""
+	info "recorded the deployed images in $env_file"
+fi
 
 info "TrustyAI is deployed in namespace $NAMESPACE"
 info "  the module operator and the workload operator it deploys are running"
