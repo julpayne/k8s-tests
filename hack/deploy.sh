@@ -16,23 +16,41 @@ require_operator_repo
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$here/.." && pwd)
 
-# reports/images.env is what `make images-all` pushed and what the checks read.
-# A deploy with different image values would leave the tests comparing against
-# the wrong references, so drop the file when any value it records is not the
-# one this deployment uses.
+# reports/images.env is what `make images-all` pushed, what `deploy-registry`
+# passes in and what the checks read. Two things keep it in step with this
+# deployment: a key whose value this deploy does not use is dropped (so the tests
+# keep comparing against the references that do describe it), and the file is
+# rewritten with the header below, which is what utilities/trustyai.py requires
+# before it trusts the file. A build that was pushed but never deployed therefore
+# records nothing the checks would compare against.
+deployed_images_header="Written by hack/deploy.sh: the images this deployment runs"
 env_file=${IMAGES_ENV_FILE:-$repo_root/reports/images.env}
 [[ "$env_file" == /* ]] || env_file="$repo_root/$env_file"
 if [[ -f "$env_file" ]]; then
+	kept=$(mktemp)
+	dropped=""
 	while IFS= read -r line; do
 		[[ -n "$line" && "$line" != "#"* && "$line" == *=* ]] || continue
 		key=${line%%=*}
 		value=${line#*=}
 		current=$(printenv "$key" 2>/dev/null || true)
-		[[ "$value" == "$current" ]] && continue
-		warn "removing stale $env_file: it records $key=$value, this deploy uses ${current:-nothing}"
-		rm -f "$env_file"
-		break
+		if [[ "$value" != "$current" ]]; then
+			dropped="${dropped:+$dropped }$key=$value"
+			continue
+		fi
+		printf '%s\n' "$line" >>"$kept"
 	done <"$env_file"
+	if [[ -n "$dropped" ]]; then
+		warn "$env_file records images this deploy does not use ($dropped); dropping them"
+	fi
+	if [[ -s "$kept" ]]; then
+		printf '# %s\n' "$deployed_images_header" >"$env_file"
+		cat "$kept" >>"$env_file"
+	else
+		warn "removing $env_file: it records no image this deploy uses"
+		rm -f "$env_file"
+	fi
+	rm -f "$kept"
 fi
 
 module_config="$OPERATOR_REPO/trustyai-operator-module/config"

@@ -91,10 +91,12 @@ make up-registry OPERATOR_REPO=/path/to/trustyai-service-operator ADAPTERS=lmes
 `ADAPTERS=all` is the default and builds every eval-hub-contrib adapter plus
 `community-lmes`; several of them are large (the GuideLLM image alone is about
 7.5 GB), so `ADAPTERS=lmes` or a list of adapter directory names is the quick
-path. `images-all` writes the resulting references to `reports/images.env`,
-`deploy-registry` passes them to `make deploy`, and the checks read the same file
-when the image variables are not set, so `make test` after a registry deploy
-compares against the images that were pushed.
+path. `images-all` writes the resulting references to `reports/images.env` and
+`deploy-registry` passes them to `make deploy`, which drops the references it
+does not use and marks the file as a record of what is running. The checks read
+that file when the image variables are not set, so `make test` after a registry
+deploy compares against the images that were pushed - and images that were built
+but never deployed do not make it compare against anything.
 
 `deploy-registry` and `up-registry` accept the same image variables as
 `deploy`/`up` (`WORKLOAD_IMG`, `MODULE_IMG`, `EVALHUB_IMG`,
@@ -102,7 +104,8 @@ compares against the images that were pushed.
 `LIGHTEVAL_IMG`). A value
 passed on the command line wins over the one recorded in `reports/images.env`,
 the same way `make up ... TRUSTYAI_SERVICE_IMG=<image>` overrides the operator's
-pin.
+pin, and the references the deploy does not use are dropped from the file so the
+checks keep comparing against the ones it does.
 
 How the images reach the cluster:
 
@@ -122,7 +125,8 @@ How the images reach the cluster:
   HTTPS client`.
 - The registry container is reused between runs; `make clean` removes it and the
   images `reports/images.env` records, leaving other images under the registry
-  prefix alone.
+  prefix alone. With podman or Docker stopped it still removes `reports/` and
+  leaves the images and the registry for a later run.
 - On a small podman machine the adapter images fill the VM quickly. Pass
   `REMOVE_AFTER_PUSH=true` to `images-all` to drop each local copy once it is
   pushed (the registry keeps it), and prefer `ADAPTERS=lmes` over `ADAPTERS=all`

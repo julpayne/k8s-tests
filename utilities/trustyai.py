@@ -43,6 +43,14 @@ IMAGE_ENV_VARS = (
     "INSPECT_IMG",
     "LIGHTEVAL_IMG",
 )
+# The two load-path images the Makefile computes from IMAGE_PREFIX and TAG, so a
+# value that is only that default can be told apart from one the caller chose.
+LOAD_PATH_IMAGES = {"WORKLOAD_IMG": "trustyai-service-operator", "MODULE_IMG": "trustyai-operator-module"}
+IMAGE_PREFIX_VAR = "IMAGE_PREFIX"
+IMAGE_TAG_VAR = "TAG"
+# hack/deploy.sh rewrites reports/images.env with this header when the deployment
+# ran the values it records; before that the file only lists what was pushed.
+IMAGES_ENV_DEPLOYED_MARKER = "Written by hack/deploy.sh"
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 IMAGES_ENV_FILE = REPO_ROOT / "reports" / "images.env"
 
@@ -61,18 +69,30 @@ def image_env_file() -> pathlib.Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def load_path_default(key: str) -> str:
+    """The image the Makefile computes for `key` when the caller did not set it."""
+    prefix = os.environ.get(IMAGE_PREFIX_VAR) or "localhost"
+    tag = os.environ.get(IMAGE_TAG_VAR) or "dev"
+    return f"{prefix}/{LOAD_PATH_IMAGES[key]}:{tag}"
+
+
 def load_image_env(path: pathlib.Path | None = None) -> None:
-    """Fill image variables from the file `make images-all` writes.
+    """Fill image variables from the file a registry deploy recorded.
+
+    `make images-all` writes what it pushed; hack/deploy.sh keeps the keys it
+    deployed and marks the file with IMAGES_ENV_DEPLOYED_MARKER. Only a marked
+    file is read, so images that were built but never deployed cannot make the
+    checks compare against something the cluster does not run.
 
     The Makefile exports `WORKLOAD_IMG`/`MODULE_IMG` with their load-path
-    defaults (`localhost/<name>:dev`), so those values are treated as unset: the
-    file records what the registry deployment actually runs. Anything else -
-    a value passed on the make command line or a different prefix - wins, and
-    hack/deploy.sh removes the file when it deployed different images.
+    defaults, so a value that is only that default is treated as unset. Anything
+    else - a value passed on the make command line or a different prefix - wins.
     """
     try:
         lines = (path or image_env_file()).read_text().splitlines()
     except OSError:
+        return
+    if not any(line.startswith("#") and IMAGES_ENV_DEPLOYED_MARKER in line for line in lines):
         return
     for line in lines:
         line = line.strip()
@@ -82,7 +102,7 @@ def load_image_env(path: pathlib.Path | None = None) -> None:
         if key not in IMAGE_ENV_VARS or not value:
             continue
         current = os.environ.get(key)
-        if not current or (key in ("WORKLOAD_IMG", "MODULE_IMG") and current.startswith("localhost/")):
+        if not current or (key in LOAD_PATH_IMAGES and current == load_path_default(key)):
             os.environ[key] = value
 
 

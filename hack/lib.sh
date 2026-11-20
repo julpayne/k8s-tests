@@ -25,12 +25,18 @@ cluster_owner_engine() {
 	done
 }
 
-# container_engine prints the container engine to build images with. ENGINE
-# wins when it is set, then KIND_PROVIDER, then the engine that owns the
-# cluster's nodes. With no cluster yet podman is preferred (it stores images
-# locally and pushes to the plain-HTTP registry without daemon configuration)
-# and docker is the fallback.
+# container_engine prints the container engine to build images with.
+# CONTAINER_ENGINE is the answer a script exports once it has resolved the
+# engine, so the per-image helpers below do not probe podman and docker again.
+# Otherwise ENGINE wins when it is set, then KIND_PROVIDER, then the engine that
+# owns the cluster's nodes. With no cluster yet podman is preferred (it stores
+# images locally and pushes to the plain-HTTP registry without daemon
+# configuration) and docker is the fallback.
 container_engine() {
+	if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
+		printf '%s' "$CONTAINER_ENGINE"
+		return
+	fi
 	if [[ -n "${ENGINE:-}" ]]; then
 		command -v "$ENGINE" >/dev/null 2>&1 || die "ENGINE=$ENGINE is not installed"
 		printf '%s' "$ENGINE"
@@ -60,15 +66,30 @@ container_engine() {
 }
 
 # kind_cmd runs the Kind CLI with the provider the cluster was created with.
-# Without it Kind asks the default (docker) provider and reports a podman
-# cluster as missing, which is what `make cluster` avoids by exporting
-# KIND_EXPERIMENTAL_PROVIDER for its own kind calls.
+# KIND_PROVIDER wins; without it Kind asks the default (docker) provider and
+# reports a podman cluster as missing, so the engine that owns the cluster's node
+# containers decides instead. `make cluster` exports KIND_EXPERIMENTAL_PROVIDER
+# for its own kind calls, and a machine with no cluster yet keeps Kind's default.
 kind_cmd() {
-	if [[ -n "${KIND_PROVIDER:-}" ]]; then
-		KIND_EXPERIMENTAL_PROVIDER="$KIND_PROVIDER" "${KIND:-kind}" "$@"
+	local provider=${KIND_PROVIDER:-}
+	if [[ -z "$provider" ]]; then
+		provider=$(cluster_owner_engine)
+	fi
+	if [[ -n "$provider" ]]; then
+		KIND_EXPERIMENTAL_PROVIDER="$provider" "${KIND:-kind}" "$@"
 	else
 		"${KIND:-kind}" "$@"
 	fi
+}
+
+# reachable_container_engine prints container_engine only when that engine answers.
+# `make clean` deletes reports and images, and only the images need an engine: with
+# the podman machine stopped it skips them instead of failing the whole clean.
+reachable_container_engine() {
+	local engine
+	engine=$(container_engine 2>/dev/null) || return 1
+	"$engine" info >/dev/null 2>&1 || return 1
+	printf '%s' "$engine"
 }
 
 # kube is the kubectl invocation every script uses, pinned to the Kind context.
@@ -157,6 +178,8 @@ ensure_registry() {
 	engine=$(container_engine)
 	name=$(registry_name)
 	REGISTRY_PORT=${REGISTRY_PORT:-5005}
+	command -v curl >/dev/null 2>&1 ||
+		die "curl is required to wait for the local registry on 127.0.0.1:${REGISTRY_PORT}"
 	alias="k8s-tests-reg-$(printf '%s' "${KIND_CLUSTER:-trustyai}" | cksum | awk '{print $1}')"
 	REGISTRY_ALIAS=$alias
 	"$engine" network inspect kind >/dev/null 2>&1 ||

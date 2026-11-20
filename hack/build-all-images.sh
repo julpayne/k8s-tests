@@ -25,6 +25,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 require_operator_repo
 
+# The engine only has to be resolved once - the lookup probes podman and docker -
+# and the per-image helpers below run in subshells, so export the answer.
+CONTAINER_ENGINE=$(container_engine)
+export CONTAINER_ENGINE
+
 cluster=${KIND_CLUSTER:-trustyai}
 tag=${TAG:-dev}
 registry_port=${REGISTRY_PORT:-5005}
@@ -77,7 +82,7 @@ validate_adapters() {
 validate_adapters
 
 kind_cmd get clusters | grep -qx "$cluster" ||
-	die "Kind cluster '$cluster' not found; create it with make cluster"
+	die "Kind cluster '$cluster' not found; create it with make cluster (or set KIND_PROVIDER to the engine that created it)"
 
 export KIND_CLUSTER="$cluster" REGISTRY_PORT="$registry_port" PLATFORM="$platform"
 ensure_registry
@@ -156,9 +161,11 @@ for adapter in "${CONTRIB_ADAPTERS[@]}"; do
 	adapter_selected "$adapter" || continue
 	context="$contrib_repo/$(adapter_context "$adapter")"
 	image="$registry/evalhub/$(adapter_image_name "$adapter"):$tag"
-	[[ -f "$context/Containerfile" ]] ||
-		die "missing $context/Containerfile; set EVALHUB_CONTRIB_REPO"
-	if [[ "$skip_build" != true ]]; then
+	if [[ "$skip_build" == true ]]; then
+		image_present "$image" || die "SKIP_BUILD=true but $image is not present"
+	else
+		[[ -f "$context/Containerfile" ]] ||
+			die "missing $context/Containerfile; set EVALHUB_CONTRIB_REPO"
 		case "$adapter" in
 		toolbench-server)
 			build_image "$image" "$context" "$context/Containerfile" --build-arg FETCH_FULL_CACHE=0
@@ -186,9 +193,11 @@ done
 lmes_img=""
 if adapter_selected lmes; then
 	lmes_img="$registry/evalhub/community-lmes:$tag"
-	[[ -f "$lmes_repo/Dockerfile.lmes-job" ]] ||
-		die "missing $lmes_repo/Dockerfile.lmes-job; set LMES_REPO"
-	if [[ "$skip_build" != true ]]; then
+	if [[ "$skip_build" == true ]]; then
+		image_present "$lmes_img" || die "SKIP_BUILD=true but $lmes_img is not present"
+	else
+		[[ -f "$lmes_repo/Dockerfile.lmes-job" ]] ||
+			die "missing $lmes_repo/Dockerfile.lmes-job; set LMES_REPO"
 		build_image "$lmes_img" "$lmes_repo" "$lmes_repo/Dockerfile.lmes-job" \
 			--build-arg "TARGETARCH=${platform##*/}"
 	fi

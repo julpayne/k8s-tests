@@ -28,12 +28,20 @@ fi
 
 # A just-started node needs a moment before the API server answers; without this
 # the kubectl wait in `make cluster` races it and fails with "the server doesn't
-# have a resource type".
+# have a resource type". TIMEOUT is the deadline that wait uses next, so allow
+# the same here.
+timeout=${TIMEOUT:-300s}
+case "$timeout" in
+*s) timeout=${timeout%s} ;;
+*m) timeout=$((${timeout%m} * 60)) ;;
+esac
+[[ "$timeout" =~ ^[0-9]+$ ]] || timeout=300
 context=${KUBE_CONTEXT:-kind-$cluster}
-for _ in {1..60}; do
+deadline=$((SECONDS + timeout))
+while ((SECONDS < deadline)); do
 	if "${KUBECTL:-kubectl}" --context "$context" get --raw=/readyz >/dev/null 2>&1; then
 		exit 0
 	fi
 	sleep 2
 done
-die "the API server for $context did not become reachable"
+die "the API server for $context did not become reachable within ${timeout}s"
