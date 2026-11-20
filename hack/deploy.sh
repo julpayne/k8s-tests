@@ -14,6 +14,19 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 require_operator_repo
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$here/.." && pwd)
+
+# reports/images.env is what `make images-all` pushed. A deploy with different
+# image values would leave the tests comparing against the wrong references, so
+# drop the file when it no longer matches this deployment.
+env_file=${IMAGES_ENV_FILE:-$repo_root/reports/images.env}
+if [[ -f "$env_file" ]]; then
+	recorded=$(sed -n 's/^MODULE_IMG=//p' "$env_file" | head -n 1)
+	if [[ -n "$recorded" && "$recorded" != "${MODULE_IMG:-}" ]]; then
+		warn "removing stale $env_file: it records $recorded, this deploy uses ${MODULE_IMG:-}"
+		rm -f "$env_file"
+	fi
+fi
 
 module_config="$OPERATOR_REPO/trustyai-operator-module/config"
 [[ -d "$module_config/default" ]] || die "missing $module_config/default"
@@ -83,6 +96,50 @@ if [[ -n "${EVALHUB_IMG:-}" ]]; then
 EOF
 )
 fi
+if [[ -n "${KUBE_RBAC_PROXY_IMG:-}" ]]; then
+	module_env_patch+=$(cat <<EOF
+
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE
+          value: $KUBE_RBAC_PROXY_IMG
+EOF
+)
+fi
+if [[ -n "${LMES_IMG:-}" ]]; then
+	module_env_patch+=$(cat <<EOF
+
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_TA_LMES_JOB_IMAGE
+          value: $LMES_IMG
+EOF
+)
+fi
+if [[ -n "${INSPECT_IMG:-}" ]]; then
+	module_env_patch+=$(cat <<EOF
+
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_EVAL_HUB_INSPECTAI_IMAGE
+          value: $INSPECT_IMG
+EOF
+)
+fi
+if [[ -n "${LIGHTEVAL_IMG:-}" ]]; then
+	module_env_patch+=$(cat <<EOF
+
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RELATED_IMAGE_ODH_EVAL_HUB_LIGHTEVAL_IMAGE
+          value: $LIGHTEVAL_IMG
+EOF
+)
+fi
 
 cat >"$workdir/kustomization.yaml" <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -110,6 +167,18 @@ if [[ -n "${EVALHUB_IMG:-}" ]]; then
 fi
 if [[ -n "${TRUSTYAI_SERVICE_IMG:-}" ]]; then
 	info "passing TrustyAI service image $TRUSTYAI_SERVICE_IMG to the workload operator"
+fi
+if [[ -n "${KUBE_RBAC_PROXY_IMG:-}" ]]; then
+	info "passing kube-rbac-proxy image $KUBE_RBAC_PROXY_IMG to the workload operator"
+fi
+if [[ -n "${LMES_IMG:-}" ]]; then
+	info "passing lm_evaluation_harness adapter image $LMES_IMG to the workload operator"
+fi
+if [[ -n "${INSPECT_IMG:-}" ]]; then
+	info "passing Inspect AI adapter image $INSPECT_IMG to the workload operator"
+fi
+if [[ -n "${LIGHTEVAL_IMG:-}" ]]; then
+	info "passing LightEval adapter image $LIGHTEVAL_IMG to the workload operator"
 fi
 kube apply -k "$workdir" --server-side=true
 
@@ -155,7 +224,6 @@ fi
 # jobs that call a model - stay the tests' business.
 command -v uv >/dev/null 2>&1 || die "uv is required to create the TrustyAI module resource; install uv"
 info "applying the TrustyAI module resource and waiting for the workload operator"
-repo_root=$(cd "$here/.." && pwd)
 (
 	cd "$repo_root"
 	KUBE_CONTEXT="$KUBE_CONTEXT" NAMESPACE="$NAMESPACE" uv run --quiet python -m utilities.stack

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import time
 from typing import Any
 
@@ -30,6 +31,47 @@ MODULE_CRD_NAME = "trustyais.components.platform.opendatahub.io"
 MODULE_CR_NAME = "default-trustyai"
 MODULE_OPERATOR_DEPLOYMENT = "trustyai-operator-module-controller-manager"
 WORKLOAD_OPERATOR_DEPLOYMENT = "trustyai-service-operator-controller-manager"
+
+# Image variables `make images-all` records in reports/images.env. The file lets
+# a test run compare the deployment against the images that were pushed without
+# asking the caller to pass every variable again.
+IMAGE_ENV_VARS = (
+    "WORKLOAD_IMG",
+    "MODULE_IMG",
+    "EVALHUB_IMG",
+    "LMES_IMG",
+    "INSPECT_IMG",
+    "LIGHTEVAL_IMG",
+)
+IMAGES_ENV_FILE = pathlib.Path(__file__).resolve().parents[1] / "reports" / "images.env"
+
+
+def load_image_env(path: pathlib.Path = IMAGES_ENV_FILE) -> None:
+    """Fill image variables from the file `make images-all` writes.
+
+    The Makefile exports `WORKLOAD_IMG`/`MODULE_IMG` with their load-path
+    defaults (`localhost/<name>:dev`), so those values are treated as unset: the
+    file records what the registry deployment actually runs. Anything else -
+    a value passed on the make command line or a different prefix - wins, and
+    hack/deploy.sh removes the file when it deployed different images.
+    """
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key not in IMAGE_ENV_VARS or not value:
+            continue
+        current = os.environ.get(key)
+        if not current or (key in ("WORKLOAD_IMG", "MODULE_IMG") and current.startswith("localhost/")):
+            os.environ[key] = value
+
+
+load_image_env()
 
 # The module resource the fixture creates. Its name is fixed by a CEL rule on the
 # CRD, so it is not a parameter anywhere in the harness.
