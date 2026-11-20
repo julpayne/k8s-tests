@@ -8,23 +8,66 @@ die() {
 	exit 1
 }
 
-# container_engine prints the container engine to build images with. podman is
-# preferred (it stores images locally and can push to the plain-HTTP registry
-# without daemon configuration); docker is the fallback.
+# cluster_owner_engine prints the engine that has this Kind cluster's node
+# containers, or nothing when neither podman nor docker can see one. The
+# cluster's provider - not which engine happens to be installed - decides where
+# the registry has to live: it joins that engine's `kind` network and the
+# scripts exec into the node containers that engine created.
+cluster_owner_engine() {
+	local cluster=${KIND_CLUSTER:-trustyai} engine
+	for engine in podman docker; do
+		command -v "$engine" >/dev/null 2>&1 || continue
+		"$engine" info >/dev/null 2>&1 || continue
+		if [[ -n "$("$engine" ps --all --quiet --filter "label=io.x-k8s.kind.cluster=$cluster" 2>/dev/null)" ]]; then
+			printf '%s' "$engine"
+			return
+		fi
+	done
+}
+
+# container_engine prints the container engine to build images with. ENGINE
+# wins when it is set, then KIND_PROVIDER, then the engine that owns the
+# cluster's nodes. With no cluster yet podman is preferred (it stores images
+# locally and pushes to the plain-HTTP registry without daemon configuration)
+# and docker is the fallback.
 container_engine() {
 	if [[ -n "${ENGINE:-}" ]]; then
 		command -v "$ENGINE" >/dev/null 2>&1 || die "ENGINE=$ENGINE is not installed"
 		printf '%s' "$ENGINE"
 		return
 	fi
-	if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-		printf podman
-	elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-		printf docker
-	elif command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
+	if [[ -n "${KIND_PROVIDER:-}" ]]; then
+		command -v "$KIND_PROVIDER" >/dev/null 2>&1 || die "KIND_PROVIDER=$KIND_PROVIDER is not installed"
+		printf '%s' "$KIND_PROVIDER"
+		return
+	fi
+	local engine owner
+	owner=$(cluster_owner_engine)
+	if [[ -n "$owner" ]]; then
+		printf '%s' "$owner"
+		return
+	fi
+	for engine in podman docker; do
+		if command -v "$engine" >/dev/null 2>&1 && "$engine" info >/dev/null 2>&1; then
+			printf '%s' "$engine"
+			return
+		fi
+	done
+	if command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
 		die "podman/docker is installed but not reachable; start the podman machine (podman machine start) or Docker Desktop"
+	fi
+	die "neither podman nor docker is installed"
+}
+
+# kind_cmd runs the Kind CLI with the provider the cluster was created with.
+# Without it Kind asks the default (docker) provider and reports a podman
+# cluster as missing, which is what `make cluster` avoids by exporting
+# KIND_EXPERIMENTAL_PROVIDER for its own kind calls.
+kind_cmd() {
+	if [[ -n "${KIND_PROVIDER:-}" ]]; then
+		KIND_EXPERIMENTAL_PROVIDER="$KIND_PROVIDER" "${KIND:-kind}" "$@"
 	else
-		die "neither podman nor docker is installed"
+		"${KIND:-kind}" "$@"
 	fi
 }
 
@@ -117,7 +160,7 @@ ensure_registry() {
 	alias="k8s-tests-reg-$(printf '%s' "${KIND_CLUSTER:-trustyai}" | cksum | awk '{print $1}')"
 	REGISTRY_ALIAS=$alias
 	"$engine" network inspect kind >/dev/null 2>&1 ||
-		die "container network 'kind' does not exist; create the cluster with make cluster"
+		die "container network 'kind' does not exist for $engine; create the cluster with make cluster, or set KIND_PROVIDER to the engine that created it"
 
 	if "$engine" container inspect "$name" >/dev/null 2>&1; then
 		status=$("$engine" container inspect --format '{{.State.Status}}' "$name")
@@ -155,11 +198,16 @@ ensure_registry() {
 # hack/kind/cluster.yaml; a cluster created before that patch has it enabled in
 # place (set PATCH_CONTAINERD=false to require a recreated cluster instead).
 configure_registry_mirrors() {
-	local engine node hosts
+	local engine node hosts nodes
 	engine=$(container_engine)
 	hosts=$(mktemp)
 	printf '[host."http://%s:5000"]\n  capabilities = ["pull", "resolve"]\n' "$REGISTRY_ALIAS" >"$hosts"
 	chmod 644 "$hosts"
+	nodes=$(kind_cmd get nodes --name "${KIND_CLUSTER:-trustyai}" 2>/dev/null || true)
+	if [[ -z "$nodes" ]]; then
+		rm -f "$hosts"
+		die "Kind cluster ${KIND_CLUSTER:-trustyai} has no nodes visible to kind; set KIND_PROVIDER when the cluster runs on podman"
+	fi
 	while IFS= read -r node; do
 		[[ -n "$node" ]] || continue
 		if ! "$engine" exec "$node" grep -q 'certs.d' /etc/containerd/config.toml 2>/dev/null; then
@@ -178,6 +226,6 @@ EOF'
 		"$engine" exec "$node" mkdir -p "/etc/containerd/certs.d/localhost:${REGISTRY_PORT}"
 		"$engine" cp "$hosts" "$node:/etc/containerd/certs.d/localhost:${REGISTRY_PORT}/hosts.toml" >/dev/null
 		info "configured localhost:${REGISTRY_PORT} mirror on $node"
-	done < <("${KIND:-kind}" get nodes --name "${KIND_CLUSTER:-trustyai}")
+	done <<<"$nodes"
 	rm -f "$hosts"
 }

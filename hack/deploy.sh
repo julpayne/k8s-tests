@@ -16,16 +16,23 @@ require_operator_repo
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$here/.." && pwd)
 
-# reports/images.env is what `make images-all` pushed. A deploy with different
-# image values would leave the tests comparing against the wrong references, so
-# drop the file when it no longer matches this deployment.
+# reports/images.env is what `make images-all` pushed and what the checks read.
+# A deploy with different image values would leave the tests comparing against
+# the wrong references, so drop the file when any value it records is not the
+# one this deployment uses.
 env_file=${IMAGES_ENV_FILE:-$repo_root/reports/images.env}
+[[ "$env_file" == /* ]] || env_file="$repo_root/$env_file"
 if [[ -f "$env_file" ]]; then
-	recorded=$(sed -n 's/^MODULE_IMG=//p' "$env_file" | head -n 1)
-	if [[ -n "$recorded" && "$recorded" != "${MODULE_IMG:-}" ]]; then
-		warn "removing stale $env_file: it records $recorded, this deploy uses ${MODULE_IMG:-}"
+	while IFS= read -r line; do
+		[[ -n "$line" && "$line" != "#"* && "$line" == *=* ]] || continue
+		key=${line%%=*}
+		value=${line#*=}
+		current=$(printenv "$key" 2>/dev/null || true)
+		[[ "$value" == "$current" ]] && continue
+		warn "removing stale $env_file: it records $key=$value, this deploy uses ${current:-nothing}"
 		rm -f "$env_file"
-	fi
+		break
+	done <"$env_file"
 fi
 
 module_config="$OPERATOR_REPO/trustyai-operator-module/config"

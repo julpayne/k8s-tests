@@ -43,10 +43,25 @@ IMAGE_ENV_VARS = (
     "INSPECT_IMG",
     "LIGHTEVAL_IMG",
 )
-IMAGES_ENV_FILE = pathlib.Path(__file__).resolve().parents[1] / "reports" / "images.env"
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+IMAGES_ENV_FILE = REPO_ROOT / "reports" / "images.env"
 
 
-def load_image_env(path: pathlib.Path = IMAGES_ENV_FILE) -> None:
+def image_env_file() -> pathlib.Path:
+    """The file holding the image references: IMAGES_ENV_FILE when it is set.
+
+    hack/build-all-images.sh, hack/deploy.sh and hack/clean.sh read the same
+    variable, so a run that moved the file is read back from where it wrote it.
+    A relative value is resolved against the checkout, the way make resolves it.
+    """
+    override = os.environ.get("IMAGES_ENV_FILE")
+    if not override:
+        return IMAGES_ENV_FILE
+    path = pathlib.Path(override)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def load_image_env(path: pathlib.Path | None = None) -> None:
     """Fill image variables from the file `make images-all` writes.
 
     The Makefile exports `WORKLOAD_IMG`/`MODULE_IMG` with their load-path
@@ -56,7 +71,7 @@ def load_image_env(path: pathlib.Path = IMAGES_ENV_FILE) -> None:
     hack/deploy.sh removes the file when it deployed different images.
     """
     try:
-        lines = path.read_text().splitlines()
+        lines = (path or image_env_file()).read_text().splitlines()
     except OSError:
         return
     for line in lines:

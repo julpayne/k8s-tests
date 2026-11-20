@@ -5,6 +5,8 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 engine=$(container_engine)
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$here/.." && pwd)
 
 for image in "$WORKLOAD_IMG" "$MODULE_IMG"; do
 	if ! "$engine" image inspect "$image" >/dev/null 2>&1; then
@@ -15,23 +17,30 @@ for image in "$WORKLOAD_IMG" "$MODULE_IMG"; do
 	"$engine" rmi "$image" >/dev/null || warn "could not remove $image"
 done
 
-report_dir=$(dirname "${REPORT_FILE:-reports/report.html}")
-if [[ -d "$report_dir" ]]; then
-	info "removing $report_dir"
-	rm -rf "$report_dir"
-fi
-
 # The registry `make images-all` starts holds the images the cluster pulled from
-# it; removing the container removes them with it. The local copies remain in
-# the engine's store, so remove the ones tagged for the registry as well.
+# it; removing the container removes them with it. The local copies stay in the
+# engine's store, so remove the ones `make images-all` recorded - not every image
+# under the registry prefix, which would also delete an image a user pushed there
+# by hand (the kube-rbac-proxy build in the README, for one).
+env_file=${IMAGES_ENV_FILE:-$repo_root/reports/images.env}
+[[ "$env_file" == /* ]] || env_file="$repo_root/$env_file"
 registry=$(registry_name)
 if "$engine" container inspect "$registry" >/dev/null 2>&1; then
 	info "removing local registry $registry"
 	"$engine" container rm -f "$registry" >/dev/null || warn "could not remove $registry"
 fi
-registry_prefix="localhost:${REGISTRY_PORT:-5005}/"
-while IFS= read -r image; do
-	[[ -n "$image" ]] || continue
-	info "removing registry image $image"
-	"$engine" rmi "$image" >/dev/null || warn "could not remove $image"
-done < <("$engine" images --format '{{.Repository}}:{{.Tag}}' | grep -F "$registry_prefix" || true)
+if [[ -f "$env_file" ]]; then
+	while IFS= read -r line; do
+		[[ -n "$line" && "$line" != "#"* && "$line" == *=* ]] || continue
+		image=${line#*=}
+		[[ -n "$image" ]] || continue
+		info "removing registry image $image"
+		"$engine" rmi "$image" >/dev/null || warn "could not remove $image"
+	done <"$env_file"
+fi
+
+report_dir=$(dirname "${REPORT_FILE:-reports/report.html}")
+if [[ -d "$report_dir" ]]; then
+	info "removing $report_dir"
+	rm -rf "$report_dir"
+fi

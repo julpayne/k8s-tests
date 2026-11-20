@@ -114,12 +114,15 @@ How the images reach the cluster:
   cluster created before that patch has it enabled in place; set
   `PATCH_CONTAINERD=false` to fail instead and recreate the cluster with
   `make down`.
-- The harness prefers podman and pushes to the plain-HTTP registry with
+- The build engine is the one that owns the Kind cluster (the cluster's node
+  containers decide it, and `KIND_PROVIDER` overrides that); with no cluster yet
+  podman is preferred. podman pushes to the plain-HTTP registry with
   `--tls-verify=false`. With Docker, the daemon must allow the local registry
   (`insecure-registries`) or the push fails with `server gave HTTP response to
   HTTPS client`.
 - The registry container is reused between runs; `make clean` removes it and the
-  registry-tagged images from the engine's store.
+  images `reports/images.env` records, leaving other images under the registry
+  prefix alone.
 - On a small podman machine the adapter images fill the VM quickly. Pass
   `REMOVE_AFTER_PUSH=true` to `images-all` to drop each local copy once it is
   pushed (the registry keeps it), and prefer `ADAPTERS=lmes` over `ADAPTERS=all`
@@ -255,17 +258,16 @@ a marker of your own belongs in `pyproject.toml` next to the others.
 | `TAG` | `dev` | Tag used by both image references |
 | `IMAGE_PREFIX` | `localhost` | Registry/repository prefix used by both image references |
 | `REGISTRY_PORT` | `5005` | Host port of the registry `images-all` starts on the `kind` network |
-| `REGISTRY` | `localhost:$(REGISTRY_PORT)` | Image prefix `deploy-registry` uses |
 | `EVALHUB_REPO` | `../eval-hub` | Checkout `images-all` builds the EvalHub service image from |
 | `EVALHUB_CONTRIB_REPO` | `../eval-hub-contrib` | Checkout `images-all` builds the adapter images from |
 | `LMES_REPO` | `../lm-evaluation-harness` | Checkout `images-all` builds `community-lmes` from (`Dockerfile.lmes-job`) |
 | `ADAPTERS` | `all` | `all`, `lmes`, or a comma-separated list of eval-hub-contrib adapter directories |
 | `LMES_IMG` / `INSPECT_IMG` / `LIGHTEVAL_IMG` | *(empty)* | Adapter image overrides passed through the module operator (`RELATED_IMAGE_ODH_*`) |
 | `PLATFORM` | engine host platform | Platform the images are built for (`linux/arm64` on Apple Silicon) |
-| `IMAGES_ENV_FILE` | `reports/images.env` | Where `images-all` writes the image references |
+| `IMAGES_ENV_FILE` | `reports/images.env` | Where `images-all` writes the image references and `deploy` and the checks read them |
 | `REMOVE_AFTER_PUSH` | *(empty)* | `images-all` removes each local image after pushing it; frees the podman machine's disk (incompatible with `SKIP_BUILD=true`) |
 | `PATCH_CONTAINERD` | `true` | Enable the certs.d config path in place on a cluster created before `hack/kind/cluster.yaml` had it |
-| `ENGINE` | auto | `podman` when it is reachable, otherwise `docker`; set it to force one |
+| `ENGINE` | auto | The engine that owns the Kind cluster (podman when there is no cluster yet); set it to force one |
 | `TIMEOUT` | `300s` | Timeout for each readiness wait |
 | `PYTEST_ARGS` | *(empty)* | Extra pytest arguments, e.g. `-m module`, `-m lmeval`, `-m adapters` or `-k evalhub` |
 | `REPORT_FILE` | `reports/report.html` | Report written by `make test` and `make test-all` |
@@ -285,8 +287,9 @@ documented under [LLM emulator](#llm-emulator).
   node (`podman exec <node> cat ...`).
 - With Docker as the engine, pushing to the plain-HTTP registry fails with
   `server gave HTTP response to HTTPS client` unless the daemon lists it under
-  `insecure-registries`. The harness prefers podman for this reason; set
-  `ENGINE=podman` explicitly when both are installed.
+  `insecure-registries`. The engine follows the cluster's provider, so a
+  podman-backed cluster (`KIND_PROVIDER=podman`) is the way to use podman's push
+  path; `ENGINE=podman` overrides the build engine when both are installed.
 - Creating a new Kind cluster on a rootless podman machine needs
   `Delegate=yes` in the machine's systemd user slice (see the
   [kind rootless documentation](https://kind.sigs.k8s.io/docs/user/rootless/)).
@@ -335,8 +338,8 @@ documented under [LLM emulator](#llm-emulator).
 
   `docker` works too, but needs `--load` on the build (buildx's `docker-container`
   driver otherwise leaves the image only in its cache) and `localhost:5005` in the
-  daemon's `insecure-registries` for the push; podman, the harness's default
-  engine, needs neither.
+  daemon's `insecure-registries` for the push; podman, what a podman-backed Kind
+  cluster uses, needs neither.
 
   then deploy with `KUBE_RBAC_PROXY_IMG=localhost:5005/odh-kube-rbac-proxy:dev`
   (`make deploy ...` or `make up ...`). The variable becomes the module
